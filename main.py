@@ -227,8 +227,16 @@ class StickerPlusPlugin(BasePlugin):
     # WebUI: management page
     # ------------------------------------------------------------------
 
+    # The page must be mounted on a non-empty subpath, never "/":
+    # - the WebUI menu store derives pageRoute from this route and falls back
+    #   to "index" for empty routes, so the iframe would request
+    #   /page/plugin/<id>/index which the StaticFiles mount cannot serve;
+    # - a root mount is stored by Starlette Mount with the trailing slash
+    #   stripped, which the host reload-cleanup prefix matching misses
+    #   (stale mount shadows re-registration -> 404 after hot reload).
+    # Same convention as the noriflow plugin's "/dashboard".
     @register.page(
-        route="/",
+        route="/dashboard",
         menu=PageMenu(
             label={"zh": "增强表情包", "en": "Sticker Plus"},
             icon="Picture",
