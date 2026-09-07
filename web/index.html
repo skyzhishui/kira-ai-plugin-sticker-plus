@@ -160,11 +160,21 @@ function esc(s) {
 
 async function call(method, path, body) {
   const opts = { method: method };
-  if (body !== undefined) opts.body = JSON.stringify(body);
+  if (body !== undefined) {
+    // FastAPI body models require an explicit JSON content type
+    opts.headers = { "Content-Type": "application/json" };
+    opts.body = JSON.stringify(body);
+  }
   const res = await fetch(API + path, opts);
   if (!res.ok) {
     let detail = res.status + " " + res.statusText;
-    try { detail = (await res.json()).detail || detail; } catch (e) {}
+    try {
+      const data = await res.json();
+      if (data && data.detail !== undefined) detail = data.detail;
+    } catch (e) {}
+    // 422 validation errors come back as an array of objects - stringify
+    // them, otherwise the toast shows "[object Object]"
+    if (typeof detail !== "string") detail = JSON.stringify(detail);
     throw new Error(detail);
   }
   if (res.status === 204) return null;
@@ -248,13 +258,13 @@ function renderGrid(items) {
       const b = document.createElement("button");
       b.className = "small " + cls;
       b.textContent = label;
-      b.addEventListener("click", fn);
+      b.addEventListener("click", e => fn(e.currentTarget));
       return b;
     };
     acts.appendChild(mkBtn("编辑", "ghost", () => openEdit(it)));
     acts.appendChild(mkBtn(it.is_banned ? "启用" : "禁用", "ghost", () => toggleBan(it)));
     acts.appendChild(mkBtn("重打标", "ghost", () => retag(it)));
-    acts.appendChild(mkBtn("删除", "danger", () => removeEmoji(it)));
+    acts.appendChild(mkBtn("删除", "danger", btn => removeEmoji(it, btn)));
     card.querySelector(".thumb").addEventListener("click", () => preview(IMG_URL(it.id)));
     grid.appendChild(card);
   }
@@ -329,8 +339,18 @@ async function retag(it) {
   } catch (e) { toast("打标失败: " + e.message, true); }
 }
 
-async function removeEmoji(it) {
-  if (!confirm("确定删除表情包 #" + it.id + "？文件会一并删除。")) return;
+async function removeEmoji(it, btn) {
+  // Two-step in-page confirmation: the plugin page iframe is sandboxed
+  // without allow-modals, so native confirm() is silently blocked.
+  if (btn.dataset.armed !== "1") {
+    btn.dataset.armed = "1";
+    btn.textContent = "确认删除?";
+    setTimeout(() => {
+      btn.dataset.armed = "0";
+      btn.textContent = "删除";
+    }, 3000);
+    return;
+  }
   try {
     await call("DELETE", "/emojis/" + it.id);
     toast("已删除");
@@ -344,8 +364,17 @@ async function uploadFiles(files) {
   for (const f of files) fd.append("files", f, f.name);
   toast("上传中…");
   try {
+    // FormData sets its own multipart content-type - do not add headers here
     const res = await fetch(API + "/emojis/upload", { method: "POST", body: fd });
-    if (!res.ok) throw new Error(res.status + " " + res.statusText);
+    if (!res.ok) {
+      let detail = res.status + " " + res.statusText;
+      try {
+        const data = await res.json();
+        if (data && data.detail !== undefined) detail = data.detail;
+      } catch (e) {}
+      if (typeof detail !== "string") detail = JSON.stringify(detail);
+      throw new Error(detail);
+    }
     const data = await res.json();
     toast("上传完成：新增 " + data.added + "，跳过 " + data.skipped);
     page = 1;
