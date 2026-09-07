@@ -1,0 +1,75 @@
+{
+  "steal_emoji": {
+    "type": "switch",
+    "name": "Steal emojis from chat",
+    "default": true,
+    "hint": "Automatically save market emojis / stickers sent by others into the library and tag them with VLM. Can also be toggled on the plugin page.",
+    "locales": {
+      "zh": {
+        "name": "偷取聊天表情",
+        "hint": "自动收藏他人发送的市场表情/表情包并入库存档，由 VLM 自动打标。也可在插件管理页开关。"
+      }
+    }
+  },
+  "capacity": {
+    "type": "integer",
+    "name": "Library capacity",
+    "default": 500,
+    "hint": "Maximum number of emojis kept in the library. When full, least-used entries are evicted first.",
+    "locales": {
+      "zh": {
+        "name": "图库容量上限",
+        "hint": "图库最多保留的表情包数量，满额后优先淘汰使用最少的。"
+      }
+    }
+  },
+  "candidate_count": {
+    "type": "integer",
+    "name": "Candidate count",
+    "default": 9,
+    "hint": "How many candidates are sampled for VLM to choose from on each send_emoji call.",
+    "locales": {
+      "zh": {
+        "name": "候选数量",
+        "hint": "每次 send_emoji 时采样多少张候选表情包给 VLM 挑选。"
+      }
+    }
+  },
+  "max_emoji_size_mb": {
+    "type": "float",
+    "name": "Max stolen emoji size (MB)",
+    "default": 5.0,
+    "hint": "Stolen emojis larger than this are skipped.",
+    "locales": {
+      "zh": {
+        "name": "偷取单图大小上限（MB）",
+        "hint": "超过此大小的表情包不做偷取。"
+      }
+    }
+  },
+  "vlm_model": {
+    "type": "model_select",
+    "name": "Tagging & selection model",
+    "model_type": "llm",
+    "default": "",
+    "hint": "Model used for VLM tagging and emoji selection. Empty = host default VLM. Must be a vision-capable model for tagging.",
+    "locales": {
+      "zh": {
+        "name": "打标与选图模型",
+        "hint": "用于 VLM 打标和表情选择的模型，留空使用系统默认 VLM。打标需要视觉能力。"
+      }
+    }
+  },
+  "emotion_tag_info": {
+    "type": "info",
+    "name": "Emotion vocabulary",
+    "hint": "Emojis are tagged with a fixed vocabulary of 20 emotion labels: 胆怯、无语、调皮、开心、困惑、震惊、傲娇、害羞、温柔、委屈、期待、生气、无辜、撒娇、嫌弃、嘲讽、感谢、安慰、悲伤、欢迎。 The send_emoji tool asks the AI to pick one of them as the emotion keyword.",
+    "level": "info",
+    "locales": {
+      "zh": {
+        "name": "情绪标签词表",
+        "hint": "表情包使用固定 20 类情绪标签打标：胆怯、无语、调皮、开心、困惑、震惊、傲娇、害羞、温柔、委屈、期待、生气、无辜、撒娇、嫌弃、嘲讽、感谢、安慰、悲伤、欢迎。send_emoji 工具让 AI 从中选一个情绪关键词。"
+      }
+    }
+  }
+}

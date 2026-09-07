@@ -1,0 +1,2 @@
+# No extra dependencies: sqlalchemy, aiosqlite, Pillow and httpx are all
+# provided by the KiraAI host runtime.

@@ -1,0 +1,21 @@
+{
+  "display_name": "增强表情包",
+  "plugin_id": "kira-ai-plugin-sticker-plus",
+  "version": "1.0.0",
+  "core_version": ">=2.31.0",
+  "author": "skyzhishui",
+  "description": "增强表情包系统：send_emoji 工具（AI 给出情绪关键词，VLM 从图库候选中选图）、聊天表情自动偷取入库（WebUI 可开关）、VLM 自动打标（画面描述 + 20 类情绪标签）、满额淘汰与防重复使用；自带 WebUI 管理页（预览 / 编辑 / 禁用 / 上传）。使用前请先在插件页禁用内置「默认表情包」插件。",
+  "tags": [
+    "sticker",
+    "emoji",
+    "chat"
+  ],
+  "repo": "http://10.0.1.90:13000/nori/kira-ai-plugin-sticker-plus",
+  "icon": "icon.svg",
+  "locales": {
+    "en": {
+      "display_name": "Sticker Plus",
+      "description": "Enhanced emoji system: send_emoji tool (AI gives an emotion keyword, VLM picks from library candidates), automatic emoji stealing from chat (toggleable in WebUI), VLM auto-tagging (description + 20 emotion labels), capacity eviction and anti-repeat usage; ships a WebUI management page (preview / edit / disable / upload). Disable the built-in sticker plugin before enabling this one."
+    }
+  }
+}

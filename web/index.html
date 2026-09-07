@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>增强表情包</title>
+<style>
+  :root {
+    --bg: #f5f7fb; --panel: #ffffff; --panel2: #f0f3f9; --line: #dde3ee;
+    --text: #24304a; --muted: #7d8aa5; --accent: #3b82f6; --ok: #16a34a;
+    --warn: #d97706; --bad: #dc2626; --pink: #db2777;
+  }
+  html[data-theme="dark"] {
+    --bg: #0f1420; --panel: #161d2e; --panel2: #1b2436; --line: #26324a;
+    --text: #dbe4f3; --muted: #7d8aa5; --accent: #4aa8ff; --ok: #43c78d;
+    --warn: #e0a83c; --bad: #e06c6c; --pink: #e07ab8;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 16px 18px 40px; background: var(--bg); color: var(--text);
+         font: 13px/1.55 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif; }
+  h1 { font-size: 16px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 12px; margin-bottom: 14px; }
+
+  .topbar { display: flex; gap: 14px; flex-wrap: wrap; align-items: center;
+            background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+            padding: 10px 14px; margin-bottom: 14px; }
+  .stat { display: flex; flex-direction: column; min-width: 56px; }
+  .stat .lbl { color: var(--muted); font-size: 11px; }
+  .stat .num { font-size: 20px; font-weight: 700; }
+  .spacer { flex: 1; }
+  .switch { display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; }
+  .switch .track { width: 38px; height: 20px; border-radius: 10px; background: var(--panel2);
+                   border: 1px solid var(--line); position: relative; transition: .15s; }
+  .switch .track i { position: absolute; top: 2px; left: 2px; width: 14px; height: 14px;
+                     border-radius: 50%; background: var(--muted); transition: .15s; }
+  .switch.on .track { background: var(--accent); border-color: var(--accent); }
+  .switch.on .track i { left: 20px; background: #fff; }
+  .switch .sw-label { font-weight: 600; }
+
+  button { background: var(--accent); color: #06121f; border: none; border-radius: 6px;
+           padding: 6px 14px; font: inherit; font-weight: 600; cursor: pointer; }
+  button.ghost { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
+  button.danger { background: transparent; color: var(--bad); border: 1px solid var(--bad); }
+  button.small { padding: 3px 9px; font-size: 12px; font-weight: 500; }
+  button:hover { filter: brightness(1.08); }
+  button:disabled { opacity: .45; cursor: default; }
+  input, select { background: var(--panel2); color: var(--text); border: 1px solid var(--line);
+        border-radius: 6px; padding: 5px 9px; font: inherit; outline: none; }
+  input:focus, select:focus { border-color: var(--accent); }
+
+  .tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; align-items: center; }
+  .tab { padding: 5px 13px; border: 1px solid var(--line); border-radius: 8px;
+         background: var(--panel); cursor: pointer; user-select: none; }
+  .tab.active { background: var(--accent); border-color: var(--accent); color: #06121f; font-weight: 600; }
+  .tabs .search { margin-left: auto; display: flex; gap: 6px; }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(158px, 1fr)); gap: 12px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+          padding: 10px; display: flex; flex-direction: column; gap: 7px; }
+  .card.banned { opacity: .55; }
+  .thumb { height: 120px; display: flex; align-items: center; justify-content: center;
+           background: var(--panel2); border-radius: 8px; overflow: hidden; cursor: zoom-in; }
+  .thumb img { max-width: 100%; max-height: 120px; }
+  .meta { display: flex; gap: 5px; flex-wrap: wrap; align-items: center; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 9px; font-size: 11px;
+           background: var(--panel2); border: 1px solid var(--line); color: var(--muted); }
+  .badge.ok { color: var(--ok); border-color: var(--ok); }
+  .badge.warn { color: var(--warn); border-color: var(--warn); }
+  .badge.bad { color: var(--bad); border-color: var(--bad); }
+  .badge.pink { color: var(--pink); border-color: var(--pink); }
+  .desc { color: var(--muted); font-size: 12px; min-height: 18px; word-break: break-all;
+          display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .emotions { font-size: 11.5px; color: var(--accent); word-break: break-all;
+              display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; overflow: hidden; }
+  .acts { display: flex; gap: 5px; flex-wrap: wrap; margin-top: auto; }
+  .pager { display: flex; gap: 8px; align-items: center; justify-content: center; margin-top: 16px;
+           color: var(--muted); }
+
+  .modal-mask { position: fixed; inset: 0; background: rgba(4,8,16,.55); display: flex;
+                align-items: center; justify-content: center; z-index: 50; }
+  .modal { background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+           padding: 16px 18px; width: min(480px, 92vw); max-height: 86vh; overflow: auto; }
+  .modal h3 { margin: 0 0 12px; font-size: 14px; }
+  .modal .field { margin-bottom: 10px; }
+  .modal .field label { display: block; color: var(--muted); font-size: 11.5px; margin-bottom: 3px; }
+  .modal textarea, .modal input[type=text] { width: 100%; }
+  .modal textarea { min-height: 64px; resize: vertical; }
+  .modal .acts { display: flex; gap: 10px; justify-content: flex-end; margin-top: 12px; }
+  .preview-lg { position: fixed; inset: 0; background: rgba(4,8,16,.72); display: flex;
+                align-items: center; justify-content: center; z-index: 60; cursor: zoom-out; }
+  .preview-lg img { max-width: 86vw; max-height: 86vh; border-radius: 10px; }
+
+  #toast { position: fixed; top: 18px; right: 18px; z-index: 99; display: flex; flex-direction: column; gap: 8px; }
+  .toast-item { background: var(--panel2); border: 1px solid var(--ok); color: var(--text);
+                border-radius: 8px; padding: 9px 14px; box-shadow: 0 6px 22px rgba(0,0,0,.35); }
+  .toast-item.err { border-color: var(--bad); }
+  .empty { color: var(--muted); text-align: center; padding: 40px 0; grid-column: 1 / -1; }
+  .hide { display: none !important; }
+</style>
+</head>
+<body>
+<h1>增强表情包</h1>
+<div class="sub">表情包图库：AI 按情绪选用 · 聊天自动收藏 · VLM 打标</div>
+
+<div class="topbar" id="topbar">
+  <div class="stat"><span class="lbl">总数</span><span class="num" id="st-total">-</span></div>
+  <div class="stat"><span class="lbl">可用</span><span class="num" id="st-active">-</span></div>
+  <div class="stat"><span class="lbl">待打标</span><span class="num" id="st-pending">-</span></div>
+  <div class="stat"><span class="lbl">已禁用</span><span class="num" id="st-banned">-</span></div>
+  <div class="stat"><span class="lbl">偷取</span><span class="num" id="st-stolen">-</span></div>
+  <div class="spacer"></div>
+  <div class="switch" id="steal-switch" title="自动收藏聊天中他人发送的表情包">
+    <span class="sw-label">偷取表情</span>
+    <div class="track"><i></i></div>
+  </div>
+  <button class="ghost" id="btn-rescan">重新扫描</button>
+  <button id="btn-upload">上传表情包</button>
+  <input type="file" id="file-input" accept=".png,.jpg,.jpeg,.gif,.webp,.bmp" multiple class="hide">
+  <button class="ghost" id="btn-refresh">刷新</button>
+</div>
+
+<div class="tabs" id="tabs">
+  <div class="tab active" data-status="all">全部</div>
+  <div class="tab" data-status="active">可用</div>
+  <div class="tab" data-status="pending">待打标</div>
+  <div class="tab" data-status="banned">已禁用</div>
+  <div class="tab" data-status="stolen">偷取的</div>
+  <div class="search">
+    <input type="text" id="search" placeholder="搜索描述/标签/哈希" style="width:190px">
+    <button class="ghost small" id="btn-search">搜索</button>
+  </div>
+</div>
+
+<div class="grid" id="grid"></div>
+<div class="pager" id="pager"></div>
+
+<div id="toast"></div>
+
+<script>
+"use strict";
+const API = "/api/plugin/kira-ai-plugin-sticker-plus";
+const IMG_URL = id => API + "/emojis/" + id + "/image";
+
+const $ = id => document.getElementById(id);
+let status = "all", search = "", page = 1, pageSize = 60, total = 0, loading = false;
+let PPC = null;
+
+function toast(msg, isErr) {
+  const item = document.createElement("div");
+  item.className = "toast-item" + (isErr ? " err" : "");
+  item.textContent = msg;
+  $("toast").appendChild(item);
+  setTimeout(() => item.remove(), 3200);
+}
+
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g,
+    c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+async function call(method, path, body) {
+  const opts = { method: method };
+  if (body !== undefined) opts.body = JSON.stringify(body);
+  const res = await fetch(API + path, opts);
+  if (!res.ok) {
+    let detail = res.status + " " + res.statusText;
+    try { detail = (await res.json()).detail || detail; } catch (e) {}
+    throw new Error(detail);
+  }
+  if (res.status === 204) return null;
+  return res.json();
+}
+
+// ---------------------------------------------------------------- settings
+async function loadSettings() {
+  try {
+    const s = await call("GET", "/settings");
+    $("st-total").textContent = s.stats.total;
+    $("st-active").textContent = s.stats.active;
+    $("st-pending").textContent = s.stats.pending;
+    $("st-banned").textContent = s.stats.banned;
+    $("st-stolen").textContent = s.stats.stolen;
+    const sw = $("steal-switch");
+    sw.classList.toggle("on", !!s.steal_emoji);
+    sw.dataset.on = s.steal_emoji ? "1" : "0";
+  } catch (e) {
+    toast("读取设置失败: " + e.message, true);
+  }
+}
+
+async function toggleSteal() {
+  const sw = $("steal-switch");
+  const target = sw.dataset.on !== "1";
+  try {
+    const r = await call("PUT", "/settings/steal", { steal_emoji: target });
+    sw.dataset.on = r.steal_emoji ? "1" : "0";
+    sw.classList.toggle("on", !!r.steal_emoji);
+    toast(r.steal_emoji ? "偷取表情已开启" : "偷取表情已关闭");
+  } catch (e) {
+    toast("切换失败: " + e.message, true);
+  }
+}
+
+// ---------------------------------------------------------------- listing
+async function load() {
+  if (loading) return;
+  loading = true;
+  try {
+    const q = "?status=" + encodeURIComponent(status)
+      + "&search=" + encodeURIComponent(search)
+      + "&page=" + page + "&page_size=" + pageSize;
+    const data = await call("GET", "/emojis" + q);
+    total = data.total;
+    renderGrid(data.items);
+    renderPager();
+  } catch (e) {
+    toast("加载失败: " + e.message, true);
+    $("grid").innerHTML = '<div class="empty">加载失败：' + esc(e.message) + "</div>";
+  } finally {
+    loading = false;
+  }
+}
+
+function renderGrid(items) {
+  const grid = $("grid");
+  grid.innerHTML = "";
+  if (!items.length) {
+    grid.innerHTML = '<div class="empty">暂无表情包</div>';
+    return;
+  }
+  for (const it of items) {
+    const card = document.createElement("div");
+    card.className = "card" + (it.is_banned ? " banned" : "");
+    const badges = [];
+    badges.push('<span class="badge ' + (it.is_banned ? "bad" : "ok") + '">#' + it.id +
+      (it.is_banned ? " 已禁用" : "") + "</span>");
+    if (!it.vlm_processed) badges.push('<span class="badge warn">待打标</span>');
+    badges.push('<span class="badge">' + (it.source === "stolen" ? "偷取" : "手动") + "</span>");
+    badges.push('<span class="badge">' + it.use_count + " 次</span>");
+    card.innerHTML =
+      '<div class="thumb"><img loading="lazy" src="' + IMG_URL(it.id) + '" alt="emoji"></div>' +
+      '<div class="meta">' + badges.join("") + "</div>" +
+      '<div class="emotions">' + esc(it.emotions || "") + "</div>" +
+      '<div class="desc" title="' + esc(it.description) + '">' + esc(it.description || "（无描述）") + "</div>" +
+      '<div class="acts"></div>';
+    const acts = card.querySelector(".acts");
+    const mkBtn = (label, cls, fn) => {
+      const b = document.createElement("button");
+      b.className = "small " + cls;
+      b.textContent = label;
+      b.addEventListener("click", fn);
+      return b;
+    };
+    acts.appendChild(mkBtn("编辑", "ghost", () => openEdit(it)));
+    acts.appendChild(mkBtn(it.is_banned ? "启用" : "禁用", "ghost", () => toggleBan(it)));
+    acts.appendChild(mkBtn("重打标", "ghost", () => retag(it)));
+    acts.appendChild(mkBtn("删除", "danger", () => removeEmoji(it)));
+    card.querySelector(".thumb").addEventListener("click", () => preview(IMG_URL(it.id)));
+    grid.appendChild(card);
+  }
+}
+
+function renderPager() {
+  const pages = Math.max(1, Math.ceil(total / pageSize));
+  const pager = $("pager");
+  pager.innerHTML = "";
+  if (pages <= 1) return;
+  const mk = (label, target, disabled) => {
+    const b = document.createElement("button");
+    b.className = "ghost small";
+    b.textContent = label;
+    b.disabled = disabled;
+    b.addEventListener("click", () => { page = target; load(); });
+    pager.appendChild(b);
+  };
+  mk("上一页", page - 1, page <= 1);
+  const info = document.createElement("span");
+  info.textContent = page + " / " + pages + " 页（共 " + total + " 张）";
+  pager.appendChild(info);
+  mk("下一页", page + 1, page >= pages);
+}
+
+// ---------------------------------------------------------------- actions
+function openEdit(it) {
+  const mask = document.createElement("div");
+  mask.className = "modal-mask";
+  mask.innerHTML =
+    '<div class="modal"><h3>编辑表情包 #' + it.id + "</h3>" +
+    '<div style="text-align:center;margin-bottom:12px"><img src="' + IMG_URL(it.id) +
+    '" style="max-height:160px;border-radius:8px"></div>' +
+    '<div class="field"><label>情绪标签（逗号分隔）</label>' +
+    '<input type="text" id="ed-emotions" value="' + esc(it.emotions || "") + '"></div>' +
+    '<div class="field"><label>画面描述</label>' +
+    '<textarea id="ed-desc">' + esc(it.description || "") + "</textarea></div>" +
+    '<div class="acts"><button class="ghost" id="ed-cancel">取消</button>' +
+    '<button id="ed-save">保存</button></div></div>';
+  document.body.appendChild(mask);
+  mask.addEventListener("click", e => { if (e.target === mask) mask.remove(); });
+  mask.querySelector("#ed-cancel").addEventListener("click", () => mask.remove());
+  mask.querySelector("#ed-save").addEventListener("click", async () => {
+    try {
+      await call("PUT", "/emojis/" + it.id, {
+        description: mask.querySelector("#ed-desc").value.trim(),
+        emotions: mask.querySelector("#ed-emotions").value.trim(),
+      });
+      toast("已保存");
+      mask.remove();
+      await Promise.all([load(), loadSettings()]);
+    } catch (e) {
+      toast("保存失败: " + e.message, true);
+    }
+  });
+}
+
+async function toggleBan(it) {
+  try {
+    await call("PUT", "/emojis/" + it.id, { is_banned: !it.is_banned });
+    toast(it.is_banned ? "已启用" : "已禁用");
+    await Promise.all([load(), loadSettings()]);
+  } catch (e) { toast("操作失败: " + e.message, true); }
+}
+
+async function retag(it) {
+  toast("正在重新打标…");
+  try {
+    await call("PUT", "/emojis/" + it.id + "/retag");
+    toast("打标完成");
+    await Promise.all([load(), loadSettings()]);
+  } catch (e) { toast("打标失败: " + e.message, true); }
+}
+
+async function removeEmoji(it) {
+  if (!confirm("确定删除表情包 #" + it.id + "？文件会一并删除。")) return;
+  try {
+    await call("DELETE", "/emojis/" + it.id);
+    toast("已删除");
+    await Promise.all([load(), loadSettings()]);
+  } catch (e) { toast("删除失败: " + e.message, true); }
+}
+
+async function uploadFiles(files) {
+  if (!files.length) return;
+  const fd = new FormData();
+  for (const f of files) fd.append("files", f, f.name);
+  toast("上传中…");
+  try {
+    const res = await fetch(API + "/emojis/upload", { method: "POST", body: fd });
+    if (!res.ok) throw new Error(res.status + " " + res.statusText);
+    const data = await res.json();
+    toast("上传完成：新增 " + data.added + "，跳过 " + data.skipped);
+    page = 1;
+    await Promise.all([load(), loadSettings()]);
+  } catch (e) { toast("上传失败: " + e.message, true); }
+}
+
+async function rescan() {
+  toast("扫描中…");
+  try {
+    const r = await call("POST", "/emojis/rescan");
+    toast("扫描完成：新入库 " + r.added + " 张");
+    await Promise.all([load(), loadSettings()]);
+  } catch (e) { toast("扫描失败: " + e.message, true); }
+}
+
+function preview(url) {
+  const mask = document.createElement("div");
+  mask.className = "preview-lg";
+  const img = document.createElement("img");
+  img.src = url;
+  mask.appendChild(img);
+  mask.addEventListener("click", () => mask.remove());
+  document.body.appendChild(mask);
+}
+
+// ---------------------------------------------------------------- wire up
+document.querySelectorAll(".tab").forEach(tab => {
+  tab.addEventListener("click", () => {
+    document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+    tab.classList.add("active");
+    status = tab.dataset.status;
+    page = 1;
+    load();
+  });
+});
+$("btn-search").addEventListener("click", () => { search = $("search").value.trim(); page = 1; load(); });
+$("search").addEventListener("keydown", e => { if (e.key === "Enter") $("btn-search").click(); });
+$("btn-refresh").addEventListener("click", () => Promise.all([load(), loadSettings()]));
+$("btn-rescan").addEventListener("click", rescan);
+$("btn-upload").addEventListener("click", () => $("file-input").click());
+$("file-input").addEventListener("change", e => { uploadFiles([...e.target.files]); e.target.value = ""; });
+$("steal-switch").addEventListener("click", toggleSteal);
+
+// Boot: wait for the bridge (cookie auth flows automatically with fetch/img)
+function boot() { loadSettings(); load(); }
+if (window.PluginPageContext && window.PluginPageContext.ready) {
+  window.PluginPageContext.ready().then(ctx => { PPC = ctx; boot(); }).catch(boot);
+} else {
+  boot();
+}
+</script>
+</body>
+</html>
