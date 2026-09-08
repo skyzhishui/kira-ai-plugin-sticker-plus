@@ -1,10 +1,10 @@
 {
   "display_name": "增强表情包",
   "plugin_id": "kira-ai-plugin-sticker-plus",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "core_version": ">=2.31.0",
   "author": "skyzhishui",
-  "description": "增强表情包系统：send_emoji 工具（AI 给出情绪关键词，由 LLM 从图库候选描述中选图）、聊天表情自动偷取入库（WebUI 可开关）、VLM 自动打标（画面描述 + 20 类情绪标签，打标与选图模型可分别配置）、满额淘汰与防重复使用；自带 WebUI 管理页（预览 / 编辑 / 禁用 / 上传）。使用前请先在插件页禁用内置「默认表情包」插件。",
+  "description": "增强表情包系统：send_emoji 工具 + <sticker> 标签（AI 给出情绪关键词，由 LLM 从图库候选描述中选图，经 <sticker> 标签以表情形式发出，QQ 为收藏表情样式 sub_type=1）、聊天表情自动偷取入库（WebUI 可开关）、VLM 自动打标（画面描述 + 20 类情绪标签，打标与选图模型可分别配置）、满额淘汰与防重复使用；自带 WebUI 管理页（预览 / 编辑 / 禁用 / 上传）。使用前请先在插件页禁用内置「默认表情包」插件。",
   "tags": [
     "sticker",
     "emoji",
@@ -15,7 +15,7 @@
   "locales": {
     "en": {
       "display_name": "Sticker Plus",
-      "description": "Enhanced emoji system: send_emoji tool (AI gives an emotion keyword, an LLM picks from library candidate descriptions), automatic emoji stealing from chat (toggleable in WebUI), VLM auto-tagging (description + 20 emotion labels; tagging and selection models are configured separately), capacity eviction and anti-repeat usage; ships a WebUI management page (preview / edit / disable / upload). Disable the built-in sticker plugin before enabling this one."
+      "description": "Enhanced emoji system: send_emoji tool + <sticker> tag (AI gives an emotion keyword, an LLM picks from library candidates, then sends via the <sticker> tag as an emoji-style image on QQ, native sticker on Telegram), automatic emoji stealing from chat (toggleable in WebUI), VLM auto-tagging (description + 20 emotion labels; tagging and selection models are configured separately), capacity eviction and anti-repeat usage; ships a WebUI management page (preview / edit / disable / upload). Disable the built-in sticker plugin before enabling this one."
     }
   }
 }

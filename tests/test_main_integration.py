@@ -87,12 +87,23 @@ async def test_send_emoji_flow(plugin):
     result = await plugin.send_emoji(event, emotion="开心")
 
     assert isinstance(result, main_mod.ToolResult)
-    assert result.attachments, "one image attachment must be returned"
-    attachment = result.attachments[0]
-    assert attachment.image_type == "path"
-    import os
-    assert os.path.exists(attachment.image)
-    assert "已选择表情包" in result.text
+    assert not result.attachments, "the <sticker> tag carries the image now"
+    assert "<sticker>" in result.text and "</sticker>" in result.text
+    # the referenced id must resolve through the sticker tag
+    emoji_id = int(result.text.split("<sticker>")[1].split("</sticker>")[0])
+    elements = await plugin.sticker_tag(str(emoji_id))
+    assert len(elements) == 1
+    from core.chat.message_elements import Sticker as StickerElement
+    assert isinstance(elements[0], StickerElement)
+    assert elements[0].sticker_id == str(emoji_id)
+    assert elements[0].file_type == "base64" and elements[0].file
+
+
+@pytest.mark.asyncio
+async def test_sticker_tag_rejects_bad_input(plugin):
+    assert await plugin.sticker_tag("not-a-number") == []
+    assert await plugin.sticker_tag("999999") == []
+    assert await plugin.sticker_tag(" 12 ") == []  # numeric but absent
 
 
 @pytest.mark.asyncio

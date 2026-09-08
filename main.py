@@ -3,9 +3,11 @@
 Ported from nori-core's nori_plugin_emoji to the KiraAI plugin model:
 
 - ``send_emoji`` tool: the AI passes an emotion keyword, the plugin samples
-  candidates (emotion LIKE match + random) and lets a VLM pick one by
-  description; the image is returned as a ``ToolResult`` attachment which the
-  AI sends via the built-in ``<file>`` tag.
+  candidates (emotion LIKE match + random) and lets an LLM pick one by
+  description; the picked emoji id goes back in the tool result and the AI
+  sends it through the plugin's ``<sticker>`` tag (QQ adapter renders the
+  sticker segment as an image with ``sub_type=1``, i.e. collected-emoji
+  style instead of a plain photo).
 - Steal hook (``@on.im_message``): market emojis / stickers sent by others
   are saved into the plugin-owned library and tagged by VLM in background.
 - WebUI: management page (preview / edit / ban / upload / rescan / steal
@@ -31,8 +33,9 @@ from pydantic import BaseModel
 
 from core.agent.func_tool_manager import ToolResult  # re-exported by core.provider too
 from core.chat import KiraMessageBatchEvent, KiraMessageEvent
-from core.chat.message_elements import Image
+from core.chat.message_elements import Sticker
 from core.plugin import BasePlugin, PageMenu, PluginPage, on, register
+from core.utils.common_utils import image_to_base64
 
 from .db import EmojiDatabase
 from .manager import EmojiManager
@@ -192,16 +195,47 @@ class StickerPlusPlugin(BasePlugin):
         if picked is None:
             return ToolResult(text="表情包库为空或暂无可用表情，未发送。")
 
-        record, file_path = picked
+        record, _ = picked
         return ToolResult(
             text=(
-                f"已选择表情包（描述：{record.description or '无'}；"
+                f"已选择表情包（编号 {record.id}；描述：{record.description or '无'}；"
                 f"情绪：{record.emotions or '无'}）。"
-                "请用 <file type=\"image\"> 标签将它作为表情包消息发送，"
+                f"请用 <sticker>{record.id}</sticker> 标签将它作为表情包消息发送，"
                 "不要和其它标签混在同一条消息里。"
             ),
-            attachments=[Image(image=str(file_path))],
         )
+
+    # ------------------------------------------------------------------
+    # Tag: <sticker>
+    # ------------------------------------------------------------------
+
+    @register.tag(
+        name="sticker",
+        description=(
+            "<sticker>id</sticker> # 发送一个图库表情包消息，"
+            "id 来自 send_emoji 工具的结果，不要凭空编造。"
+            "可单独作为一条消息或与文字消息一起发送。"
+        ),
+    )
+    async def sticker_tag(self, value: str, **kwargs) -> list:
+        """Send a library emoji by id as a sticker-type message."""
+        if self._manager is None:
+            return []
+        try:
+            emoji_id = int(str(value).strip())
+        except (TypeError, ValueError):
+            logger.warning("Sticker tag got non-numeric id: %r", value)
+            return []
+        record = await self._manager.get_emoji(emoji_id)
+        if record is None or record.get("is_banned"):
+            logger.warning("Sticker tag id #%s not found or banned", emoji_id)
+            return []
+        file_path = await self._manager.emoji_file(emoji_id)
+        if file_path is None:
+            logger.warning("Sticker tag id #%s file missing", emoji_id)
+            return []
+        sticker_b64 = await image_to_base64(str(file_path))
+        return [Sticker(sticker_id=str(emoji_id), sticker=sticker_b64)]
 
     # ------------------------------------------------------------------
     # Hooks
