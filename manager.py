@@ -41,6 +41,10 @@ _FORMAT_EXTENSIONS = {
     "bmp": ".bmp",
 }
 
+# A row whose tagging keeps failing is banned after this many strikes, so it
+# leaves the unprocessed queue instead of poisoning every batch.
+_MAX_TAG_FAILURES = 3
+
 
 class EmojiManager:
     def __init__(
@@ -109,7 +113,13 @@ class EmojiManager:
     # ------------------------------------------------------------------
 
     async def scan_directory(self) -> int:
-        """Register image files dropped into the emoji dir (source=manual)."""
+        """Register image files dropped into the emoji dir (source=manual).
+
+        Payloads Pillow cannot identify are skipped even with an image
+        extension (they would poison the tagging queue), and newly registered
+        rows trigger background tagging so a manual rescan completes the
+        whole import instead of leaving rows stuck at "pending".
+        """
         count = 0
         async with self._db.session() as session:
             repo = EmojiRepository(session)
@@ -123,6 +133,9 @@ class EmojiManager:
                 except OSError as exc:
                     logger.warning("Failed to read emoji file %s: %s", file_path, exc)
                     continue
+                if self._detect_image_extension(data) is None:
+                    logger.warning("Skipping non-image file in emoji dir: %s", file_path.name)
+                    continue
                 file_hash = hashlib.sha256(data).hexdigest()
                 if await repo.find_by_hash(file_hash) is not None:
                     continue
@@ -131,6 +144,7 @@ class EmojiManager:
             await session.commit()
         if count:
             logger.info("Directory scan registered %d new emojis", count)
+            self._spawn(self._tag_pending_background())
         return count
 
     async def add_emoji_from_bytes(self, data: bytes, source: str = "stolen") -> bool:
@@ -143,8 +157,13 @@ class EmojiManager:
         """
         if not data:
             return False
-        file_hash = hashlib.sha256(data).hexdigest()
         extension = self._detect_image_extension(data)
+        if extension is None:
+            # Non-image payloads (corrupt files, video stickers, ...) would
+            # fail tagging forever; reject them at the door instead.
+            logger.info("Rejected non-image emoji payload (%d bytes)", len(data))
+            return False
+        file_hash = hashlib.sha256(data).hexdigest()
         file_name = f"{file_hash}{extension}"
         file_path = self._emoji_dir / file_name
 
@@ -173,14 +192,20 @@ class EmojiManager:
         return True
 
     @staticmethod
-    def _detect_image_extension(data: bytes) -> str:
-        """Sniff the real image format from the header (Pillow lazy open)."""
+    def _detect_image_extension(data: bytes) -> Optional[str]:
+        """Sniff the real image format from the header (Pillow lazy open).
+
+        Returns None when Pillow cannot identify the payload or the format is
+        not one we can serve - the caller must reject such input rather than
+        storing it under a fake ".png" name where it would fail tagging
+        forever ("poison" rows).
+        """
         try:
             with Image.open(io.BytesIO(data)) as img:
                 fmt = (img.format or "").lower()
         except Exception:
-            return ".png"
-        return _FORMAT_EXTENSIONS.get(fmt, ".png")
+            return None
+        return _FORMAT_EXTENSIONS.get(fmt)
 
     # ------------------------------------------------------------------
     # Selection
@@ -279,7 +304,12 @@ class EmojiManager:
     # ------------------------------------------------------------------
 
     async def tag_pending(self, batch_size: int = 10) -> int:
-        """Tag up to batch_size unprocessed emojis; returns tagged count."""
+        """Tag up to batch_size unprocessed emojis; returns tagged count.
+
+        Failures are counted per row; a row is auto-banned after
+        ``_MAX_TAG_FAILURES`` strikes so permanently broken files leave the
+        queue instead of being retried forever.
+        """
         tagged = 0
         # Short read-only transaction: collect work, ban missing files.
         pending_work: list[tuple[EmojiImage, Path]] = []
@@ -294,30 +324,46 @@ class EmojiManager:
             await session.commit()
 
         # VLM calls outside the transaction.
-        results: list[tuple[int, str, str]] = []
+        tagged_rows: list[tuple[int, str, str]] = []
+        failed_ids: list[int] = []
         for emoji, file_path in pending_work:
             try:
                 description, emotions = await self._vlm.tag_emoji(file_path)
-                results.append((emoji.id, description, emotions))
+                tagged_rows.append((emoji.id, description, emotions))
                 tagged += 1
             except Exception as exc:
                 logger.warning("Tagging failed for #%s: %s", emoji.id, exc)
+                failed_ids.append(emoji.id)
 
-        if results:
+        if tagged_rows or failed_ids:
             async with self._db.session() as session:
                 repo = EmojiRepository(session)
-                for emoji_id, description, emotions in results:
+                for emoji_id, description, emotions in tagged_rows:
                     await repo.tag(emoji_id, description, emotions)
+                for emoji_id in failed_ids:
+                    if await repo.record_tag_failure(emoji_id, _MAX_TAG_FAILURES):
+                        logger.warning(
+                            "Emoji #%s banned after %d tagging failures",
+                            emoji_id, _MAX_TAG_FAILURES,
+                        )
                 await session.commit()
         return tagged
 
     async def _tag_pending_background(self) -> None:
-        """Serialized fire-and-forget tagging."""
+        """Serialized fire-and-forget tagging; drains the whole backlog.
+
+        Keeps batching while progress is made and stops on the first
+        empty/unproductive batch (queue drained, or only rows that keep
+        failing - those accumulate strikes and get banned).
+        """
         async with self._tag_lock:
             try:
-                tagged = await self.tag_pending(batch_size=20)
-                if tagged:
-                    logger.info("Background tagging finished: %d emojis", tagged)
+                while True:
+                    tagged = await self.tag_pending(batch_size=20)
+                    if tagged:
+                        logger.info("Background tagging batch finished: %d emojis", tagged)
+                    if tagged == 0:
+                        break
             except Exception as exc:
                 logger.warning("Background tagging error: %s", exc)
 
@@ -329,12 +375,16 @@ class EmojiManager:
             if emoji is None:
                 return False
             file_path = self._emoji_dir / emoji.path
-            if not file_path.exists():
-                return False
-            description, emotions = await self._vlm.tag_emoji(file_path)
+        if not file_path.exists():
+            return False
+        # VLM call outside any session scope (same convention as tag/pick);
+        # only the short read and the short write-back touch the database.
+        description, emotions = await self._vlm.tag_emoji(file_path)
+        async with self._db.session() as session:
+            repo = EmojiRepository(session)
             await repo.tag(emoji_id, description, emotions)
             await session.commit()
-            return True
+        return True
 
     # ------------------------------------------------------------------
     # Eviction
@@ -417,3 +467,8 @@ class EmojiManager:
     async def stats(self) -> dict:
         async with self._db.session() as session:
             return await EmojiRepository(session).stats()
+
+    async def count_active(self) -> int:
+        """Selectable emoji count (cheap gate for guidance injection)."""
+        async with self._db.session() as session:
+            return await EmojiRepository(session).count_active()

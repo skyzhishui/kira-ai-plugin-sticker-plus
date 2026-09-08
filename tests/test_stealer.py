@@ -84,6 +84,6 @@ async def test_broken_payload_ignored(env):
     event = make_event([Sticker(sticker=b64(b"junk-not-an-image"))])
     await stealer.handle_event(event)
     await stealer.shutdown()
-    # still stored (intake validates via Pillow and falls back to .png);
-    # extraction-level failures are what must never raise
+    # extraction still hands the bytes to intake; content rejection is the
+    # manager's job (see test_manager). What must never raise is extraction.
     assert len(manager.calls) == 1

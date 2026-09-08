@@ -206,6 +206,13 @@ class StickerPlusPlugin(BasePlugin):
         """Append emoji usage guidance to the tools prompt section."""
         if self._manager is None:
             return
+        try:
+            # Nothing selectable yet (empty library or everything pending):
+            # guidance would only invite a doomed send_emoji call.
+            if await self._manager.count_active() == 0:
+                return
+        except Exception:
+            return
         for prompt in req.system_prompt:
             if prompt.name == "tools":
                 prompt.content = f"{prompt.content}\n{USAGE_GUIDANCE}"
@@ -350,13 +357,12 @@ class StickerPlusPlugin(BasePlugin):
 
     @register.api(method="GET", path="/settings")
     async def get_settings(self):
-        if self._manager is None:
-            raise HTTPException(status_code=503, detail="Emoji library not initialized")
-        stats = await self._manager.stats()
+        manager = self._require_manager()
+        stats = await manager.stats()
         return {
             "steal_emoji": bool(self.plugin_cfg.get("steal_emoji", True)),
-            "capacity": self._manager.capacity,
-            "candidate_count": self._manager.candidate_count,
+            "capacity": manager.capacity,
+            "candidate_count": manager.candidate_count,
             "max_emoji_size_mb": float(self.plugin_cfg.get("max_emoji_size_mb", 5.0)),
             "vlm_model": str(self.plugin_cfg.get("vlm_model", "") or ""),
             "stats": stats,

@@ -111,3 +111,38 @@ async def test_steal_hook_stores_sticker(plugin):
     items, total = await plugin._manager.list_emojis()
     assert total == 1
     assert items[0]["source"] == "stolen"
+
+
+@pytest.mark.asyncio
+async def test_steal_hook_rejects_non_image(plugin):
+    # e.g. a Telegram video sticker: extracted fine, rejected at intake
+    event = SimpleNamespace(
+        message=SimpleNamespace(
+            chain=[Sticker(sticker=b64(b"webm-video-sticker-bytes"))],
+            sender=SimpleNamespace(user_id="10001"),
+            self_id="99999",
+        )
+    )
+    await plugin.steal_emoji(event)
+    await plugin._stealer.shutdown()
+    _, total = await plugin._manager.list_emojis()
+    assert total == 0
+
+
+def _guidance_req():
+    return SimpleNamespace(system_prompt=[SimpleNamespace(name="tools", content="base")])
+
+
+@pytest.mark.asyncio
+async def test_guidance_injection_gated_on_active_library(plugin):
+    # empty library -> guidance stays out of the prompt
+    req = _guidance_req()
+    await plugin.inject_emoji_guidance(None, req, None)
+    assert req.system_prompt[0].content == "base"
+
+    assert await plugin._manager.add_emoji_from_bytes(make_png_bytes(color=(21, 21, 21)), "manual")
+    if plugin._manager._bg_tasks:
+        await asyncio.gather(*list(plugin._manager._bg_tasks), return_exceptions=True)
+    req = _guidance_req()
+    await plugin.inject_emoji_guidance(None, req, None)
+    assert "send_emoji" in req.system_prompt[0].content

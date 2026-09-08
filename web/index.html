@@ -216,10 +216,18 @@ async function load() {
   if (loading) return;
   loading = true;
   try {
-    const q = "?status=" + encodeURIComponent(status)
-      + "&search=" + encodeURIComponent(search)
-      + "&page=" + page + "&page_size=" + pageSize;
-    const data = await call("GET", "/emojis" + q);
+    let data = null;
+    for (let i = 0; i < 2; i++) {
+      const q = "?status=" + encodeURIComponent(status)
+        + "&search=" + encodeURIComponent(search)
+        + "&page=" + page + "&page_size=" + pageSize;
+      data = await call("GET", "/emojis" + q);
+      // Empty page past the end (e.g. last item of the last page deleted):
+      // snap back to the final page and fetch once more.
+      const pages = Math.max(1, Math.ceil(data.total / pageSize));
+      if (data.items.length > 0 || page <= pages) break;
+      page = pages;
+    }
     total = data.total;
     renderGrid(data.items);
     renderPager();

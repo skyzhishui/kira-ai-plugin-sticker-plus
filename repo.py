@@ -42,13 +42,30 @@ class EmojiRepository:
         return emoji
 
     async def tag(self, emoji_id: int, description: str, emotions: str) -> None:
-        """Write back a VLM tagging result."""
+        """Write back a VLM tagging result (resets the failure counter)."""
         emoji = await self._session.get(EmojiImage, emoji_id)
         if emoji is None:
             return
         emoji.description = description
         emoji.emotions = emotions
         emoji.vlm_processed = True
+        emoji.tag_fail_count = 0
+
+    async def record_tag_failure(self, emoji_id: int, max_failures: int) -> bool:
+        """Count one tagging failure; auto-ban after ``max_failures`` strikes.
+
+        Banned rows leave the unprocessed queue (see ``get_unprocessed``) so a
+        permanently broken file cannot starve the tagging pipeline. Returns
+        True when this call banned the row.
+        """
+        emoji = await self._session.get(EmojiImage, emoji_id)
+        if emoji is None:
+            return False
+        emoji.tag_fail_count = int(emoji.tag_fail_count or 0) + 1
+        if emoji.tag_fail_count >= max_failures:
+            emoji.is_banned = True
+            return True
+        return False
 
     async def update_fields(
         self,
@@ -256,10 +273,14 @@ class EmojiRepository:
         }
 
     async def get_unprocessed(self, limit: int = 50) -> list[EmojiImage]:
-        """Untagged emojis for the background tagger (oldest first)."""
+        """Untagged, not-banned emojis for the background tagger (oldest first).
+
+        Banned rows are excluded: missing files and repeated tagging failures
+        get banned, and they must stop occupying queue slots.
+        """
         result = await self._session.execute(
             select(EmojiImage)
-            .where(EmojiImage.vlm_processed.is_(False))
+            .where(EmojiImage.vlm_processed.is_(False), EmojiImage.is_banned.is_(False))
             .order_by(EmojiImage.created_at)
             .limit(limit)
         )
@@ -275,7 +296,10 @@ class EmojiRepository:
         Priority (ported from upstream):
         1. already-tagged rows evicted first, protecting freshly stolen ones;
         2. lowest use_count first;
-        3. oldest last_used_at first (SQLite ASC puts NULL first = oldest).
+        3. oldest last_used_at first (SQLite ASC puts NULL first = oldest);
+        4. oldest created_at / id as deterministic tiebreakers, so when the
+           keys above all tie (e.g. a full library of never-used untagged
+           rows) a freshly added row is never the victim.
         """
         total = await self.count_all()
         if total <= capacity:
@@ -287,6 +311,8 @@ class EmojiRepository:
                 EmojiImage.vlm_processed.desc(),
                 EmojiImage.use_count.asc(),
                 EmojiImage.last_used_at.asc(),
+                EmojiImage.created_at.asc(),
+                EmojiImage.id.asc(),
             )
             .limit(excess)
         )

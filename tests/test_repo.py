@@ -157,6 +157,47 @@ async def test_list_emojis_filters_search_pagination(db):
 
 
 @pytest.mark.asyncio
+async def test_record_tag_failure_bans_after_max(db):
+    ids = await _seed(db, [{"hash": "a" * 64, "path": "a.png"}])
+    async with db.session() as session:
+        repo = EmojiRepository(session)
+        assert await repo.record_tag_failure(ids[0], 3) is False
+        assert await repo.record_tag_failure(ids[0], 3) is False
+        assert await repo.record_tag_failure(ids[0], 3) is True  # 3rd strike bans
+        emoji = await repo.get(ids[0])
+        assert emoji.is_banned is True
+        assert emoji.tag_fail_count == 3
+        # banned rows leave the unprocessed queue
+        assert await repo.get_unprocessed(limit=10) == []
+        await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_evict_tiebreak_prefers_oldest_created(db):
+    from datetime import datetime, timedelta
+
+    ids = await _seed(db, [
+        {"hash": "a" * 64, "path": "a.png"},
+        {"hash": "b" * 64, "path": "b.png"},
+        {"hash": "c" * 64, "path": "c.png"},
+    ])
+    base = datetime(2026, 1, 1)
+    async with db.session() as session:
+        repo = EmojiRepository(session)
+        for i, emoji_id in enumerate(ids):
+            emoji = await repo.get(emoji_id)
+            emoji.created_at = base + timedelta(days=i)
+        await session.commit()
+    async with db.session() as session:
+        repo = EmojiRepository(session)
+        victims = await repo.evict_if_full(capacity=2)
+        await session.commit()
+        # all primary keys tie (untagged, never used) -> oldest created is the
+        # victim, the freshly added row survives
+        assert [v.path for v in victims] == ["a.png"]
+
+
+@pytest.mark.asyncio
 async def test_stats(db):
     await _seed(db, [
         {"hash": "a" * 64, "path": "a.png", "tag": True, "banned": True},

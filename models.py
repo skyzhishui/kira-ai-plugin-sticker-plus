@@ -43,6 +43,10 @@ class EmojiImage(Base):
     use_count: Mapped[int] = mapped_column(Integer, default=0)
     is_banned: Mapped[bool] = mapped_column(Boolean, default=False)
     vlm_processed: Mapped[bool] = mapped_column(Boolean, default=False)
+    tag_fail_count: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0",
+        comment="Consecutive VLM tagging failures; row is auto-banned at the cap",
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
     last_used_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 

@@ -69,6 +69,19 @@ class FakeTagVLM(EmojiVLM):
         return 0, "first"
 
 
+class FailingTagVLM(EmojiVLM):
+    """Tagger that always raises - models permanently broken tagging."""
+
+    def __init__(self):
+        super().__init__(client_resolver=lambda: None)
+
+    async def tag_emoji(self, image_path):
+        raise RuntimeError("tagging always fails")
+
+    async def select_emoji_by_description(self, descriptions, emoji_hint, recent_context=""):
+        return 0, "first"
+
+
 class FakeStealManager:
     """Records add_emoji_from_bytes calls for stealer tests."""
 
