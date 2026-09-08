@@ -12,6 +12,16 @@ jobs:
     name: Plugin test suite (KiraAI host @ main)
     runs-on: ubuntu-latest
     steps:
+      # Order matters: the host checkout runs `git clean -ffdx` on its fresh
+      # tree, which would wipe a plugin directory placed first, so the host
+      # must land before the plugin.
+      - name: Checkout KiraAI host
+        uses: actions/checkout@v4
+        with:
+          repository: xxynet/KiraAI
+          ref: main
+          path: KiraAI
+
       # The suite expects the plugin to live at
       # data/plugins/kira-ai-plugin-sticker-plus inside a KiraAI checkout
       # (tests/conftest.py walks up to find core/ and webui/).
@@ -19,13 +29,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: KiraAI/data/plugins/kira-ai-plugin-sticker-plus
-
-      - name: Checkout KiraAI host
-        uses: actions/checkout@v4
-        with:
-          repository: xxynet/KiraAI
-          ref: main
-          path: KiraAI
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
