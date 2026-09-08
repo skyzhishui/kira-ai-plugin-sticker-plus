@@ -10,7 +10,7 @@
     "emoji",
     "chat"
   ],
-  "repo": "http://10.0.1.90:13000/nori/kira-ai-plugin-sticker-plus",
+  "repo": "https://github.com/skyzhishui/kira-ai-plugin-sticker-plus",
   "icon": "icon.svg",
   "locales": {
     "en": {

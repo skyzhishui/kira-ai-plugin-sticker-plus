@@ -1,8 +1,7 @@
 # kira-ai-plugin-sticker-plus（增强表情包）
 
-KiraAI 增强表情包插件，移植自 nori-core 的 `nori_plugin_emoji` 并按 KiraAI
-插件规范重写。AI 通过 `send_emoji` 工具按情绪发图（VLM 候选择优），同时自动
-收藏聊天中他人发送的表情包，形成越用越懂你的表情包图库。
+KiraAI 增强表情包插件。AI 通过 `send_emoji` 工具按情绪发图（LLM 从候选描述中
+择优），同时自动收藏聊天中他人发送的表情包，形成越用越懂你的表情包图库。
 
 > ⚠️ **使用前请先在 WebUI 插件页禁用内置「默认表情包」插件**，否则 AI 会同时
 > 看到两条表情包通道（内置 `<sticker>` 标签清单 + 本插件的 send_emoji 工具），
@@ -66,14 +65,8 @@ WebUI 插件配置页可视化编辑：
 python -m pytest data/plugins/kira-ai-plugin-sticker-plus/tests -q
 ```
 
-## 已知降级
-
-QQ 通道上表情包以普通图片消息发出（宿主 QQ 适配器把 Sticker/Image 统一编码为
-base64 图片），对方看到的是图片而非"收藏表情"，这是平台协议限制，无法在
-插件层修复。
-
 ## 来源与许可
 
-移植自 nori-core 仓库 `plugins/nori_plugin_emoji`（MIT），核心算法
+移植自 nori-core 插件`plugins/nori_plugin_emoji`（MIT），核心算法
 （情绪采样 / 防重复 / 淘汰策略 / 提示词）保持一致，宿主适配层
 （工具注册 / hook / WebUI / 存储）按 KiraAI 插件规范重写。
