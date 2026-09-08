@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Plugin test suite (KiraAI host @ main)
+    runs-on: ubuntu-latest
+    steps:
+      # The suite expects the plugin to live at
+      # data/plugins/kira-ai-plugin-sticker-plus inside a KiraAI checkout
+      # (tests/conftest.py walks up to find core/ and webui/).
+      - name: Checkout plugin into host layout
+        uses: actions/checkout@v4
+        with:
+          path: KiraAI/data/plugins/kira-ai-plugin-sticker-plus
+
+      - name: Checkout KiraAI host
+        uses: actions/checkout@v4
+        with:
+          repository: xxynet/KiraAI
+          ref: main
+          path: KiraAI
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r KiraAI/requirements.txt
+          pip install pytest pytest-asyncio
+
+      - name: Run tests
+        working-directory: KiraAI
+        run: python -m pytest data/plugins/kira-ai-plugin-sticker-plus/tests -q
