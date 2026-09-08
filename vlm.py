@@ -15,12 +15,16 @@ from __future__ import annotations
 
 import base64
 import json
-import logging
 import re
 from pathlib import Path
 from typing import Callable, Optional
 
-logger = logging.getLogger(__name__)
+# Same registered name as main.py -> same logger object. Host
+# get_logger is required: plain getLogger lines never reach
+# data/log.log (the file handler whitelists host-registered names).
+from core.logging_manager import get_logger  # noqa: E402
+
+logger = get_logger("sticker-plus", "green")
 
 _PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 

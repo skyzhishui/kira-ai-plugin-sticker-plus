@@ -15,7 +15,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import io
-import logging
 import random
 from pathlib import Path
 from typing import Optional
@@ -28,7 +27,12 @@ from .models import EmojiImage
 from .repo import EmojiRepository
 from .vlm import EmojiVLM
 
-logger = logging.getLogger(__name__)
+# Same registered name as main.py -> same logger object. Host
+# get_logger is required: plain getLogger lines never reach
+# data/log.log (the file handler whitelists host-registered names).
+from core.logging_manager import get_logger  # noqa: E402
+
+logger = get_logger("sticker-plus", "green")
 
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 

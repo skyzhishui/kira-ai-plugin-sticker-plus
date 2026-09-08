@@ -83,7 +83,9 @@ async def test_send_emoji_flow(plugin):
     stats = await plugin._manager.stats()
     assert stats["active"] == 2
 
-    event = SimpleNamespace(message_str="今天真开心呀，哈哈")
+    event = SimpleNamespace(
+        messages=[SimpleNamespace(message_str="今天真开心呀，哈哈")]
+    )
     result = await plugin.send_emoji(event, emotion="开心")
 
     assert isinstance(result, main_mod.ToolResult)
@@ -98,6 +100,17 @@ async def test_send_emoji_flow(plugin):
     assert elements[0].sticker_id == str(emoji_id)
     assert elements[0].file_type == "base64" and elements[0].file
 
+    # Regression: the selection prompt must carry the triggering batch text
+    # (built from event.messages[].message_str, not the never-set batch field).
+    selection_texts = [
+        p["text"]
+        for r in plugin.ctx._client.requests
+        for p in r.messages[0]["content"]
+        if p["type"] == "text" and "从以下表情包中选择" in p["text"]
+    ]
+    assert selection_texts, "selection prompt was not requested"
+    assert "今天真开心呀，哈哈" in selection_texts[-1]
+
 
 @pytest.mark.asyncio
 async def test_sticker_tag_rejects_bad_input(plugin):
@@ -108,7 +121,9 @@ async def test_sticker_tag_rejects_bad_input(plugin):
 
 @pytest.mark.asyncio
 async def test_send_emoji_empty_hint(plugin):
-    result = await plugin.send_emoji(SimpleNamespace(message_str="x"), emotion="")
+    result = await plugin.send_emoji(
+        SimpleNamespace(messages=[SimpleNamespace(message_str="x")]), emotion=""
+    )
     assert isinstance(result, main_mod.ToolResult)
     assert not result.attachments
 

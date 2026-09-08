@@ -23,7 +23,6 @@ otherwise the AI sees two emoji channels.
 
 from __future__ import annotations
 
-import logging
 from pathlib import Path
 from typing import Optional
 
@@ -34,6 +33,7 @@ from pydantic import BaseModel
 from core.agent.func_tool_manager import ToolResult  # re-exported by core.provider too
 from core.chat import KiraMessageBatchEvent, KiraMessageEvent
 from core.chat.message_elements import Sticker
+from core.logging_manager import get_logger
 from core.plugin import BasePlugin, PageMenu, PluginPage, on, register
 from core.utils.common_utils import image_to_base64
 
@@ -42,7 +42,10 @@ from .manager import EmojiManager
 from .stealer import EmojiStealer
 from .vlm import EmojiVLM
 
-logger = logging.getLogger(__name__)
+# Host get_logger: registers the name in the file-handler whitelist, so
+# plugin lines actually reach data/log.log and the WebUI log console
+# (plain logging.getLogger lines are filtered out in production).
+logger = get_logger("sticker-plus", "green")
 
 PLUGIN_ID = "kira-ai-plugin-sticker-plus"
 
@@ -185,7 +188,15 @@ class StickerPlusPlugin(BasePlugin):
         if not emotion:
             return ToolResult(text="缺少情绪关键词，未发送表情包。")
 
-        recent_context = (event.message_str or "")[-500:]
+        # The batch event's own message_str is never populated by the host;
+        # the formatted text lives on each KiraIMMessage in event.messages.
+        batch_text = "\n".join(
+            m.message_str for m in event.messages if m.message_str
+        )
+        recent_context = batch_text[-500:]
+        # DEBUG only reaches the WebUI log console (file level is INFO);
+        # confirms what the selection LLM actually receives as context.
+        logger.debug("send_emoji recent_context (%d chars): %s", len(recent_context), recent_context or "(empty)")
         try:
             picked = await self._manager.pick_emoji(emotion, recent_context)
         except Exception as exc:
