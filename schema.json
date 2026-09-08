@@ -49,14 +49,27 @@
   },
   "vlm_model": {
     "type": "model_select",
-    "name": "Tagging & selection model",
+    "name": "Tagging model (vision)",
     "model_type": "llm",
     "default": "",
-    "hint": "Model used for VLM tagging and emoji selection. Empty = host default VLM. Must be a vision-capable model for tagging.",
+    "hint": "Model used to tag stolen/uploaded emojis (image + text prompt, vision required). Empty = host default VLM.",
     "locales": {
       "zh": {
-        "name": "打标与选图模型",
-        "hint": "用于 VLM 打标和表情选择的模型，留空使用系统默认 VLM。打标需要视觉能力。"
+        "name": "打标模型（需视觉）",
+        "hint": "用于给偷取/上传的表情包打标的模型（图片+文字输入，需要视觉能力）。留空使用系统默认 VLM。"
+      }
+    }
+  },
+  "selection_model": {
+    "type": "model_select",
+    "name": "Selection model (text-only)",
+    "model_type": "llm",
+    "default": "",
+    "hint": "Model used to pick one emoji from candidate descriptions on send_emoji. Text-only task, no vision needed - any chat model works. Empty = host default LLM.",
+    "locales": {
+      "zh": {
+        "name": "选图模型（纯文本）",
+        "hint": "send_emoji 时从候选描述中挑选一张的模型。纯文本任务，无需视觉能力，任意对话模型皆可。留空使用系统默认 LLM。"
       }
     }
   },

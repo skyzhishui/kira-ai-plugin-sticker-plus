@@ -84,6 +84,40 @@ async def test_select_empty_candidates_raises():
         await vlm.select_emoji_by_description([], "开心")
 
 
+@pytest.mark.asyncio
+async def test_selection_routes_through_dedicated_client():
+    # Selection is text-only and may use a different (non-vision) model.
+    tag_client = FakeClient([])
+    sel_client = FakeClient(['{"emoji_index": 1, "reason": "匹配"}'])
+    vlm = EmojiVLM(
+        client_resolver=lambda: tag_client,
+        selection_client_resolver=lambda: sel_client,
+    )
+    idx, _ = await vlm.select_emoji_by_description(["a", "b"], "开心")
+    assert idx == 0
+    assert len(sel_client.requests) == 1
+    assert not tag_client.requests, "selection must not touch the tagging client"
+    content = sel_client.requests[0].messages[0]["content"]
+    assert [part["type"] for part in content] == ["text"]
+
+
+@pytest.mark.asyncio
+async def test_selection_falls_back_to_tagging_client():
+    client = FakeClient(['{"emoji_index": 1, "reason": "匹配"}'])
+    vlm = EmojiVLM(client_resolver=lambda: client)
+    _, _ = await vlm.select_emoji_by_description(["a"], "开心")
+    assert len(client.requests) == 1
+
+
+def test_selection_client_none_raises():
+    vlm = EmojiVLM(
+        client_resolver=lambda: object(),
+        selection_client_resolver=lambda: None,
+    )
+    with pytest.raises(RuntimeError):
+        vlm._selection_client()
+
+
 # ----------------------------------------------------------------------
 # Tagging
 # ----------------------------------------------------------------------

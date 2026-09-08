@@ -42,10 +42,22 @@ def _render_prompt(name: str, **vars: str) -> str:
 
 
 class EmojiVLM:
-    """Tag emojis and pick one via the host LLM/VLM client."""
+    """Tag emojis and pick one via the host LLM/VLM client.
 
-    def __init__(self, client_resolver: Callable[[], object]):
+    Tagging sends the image to the model (vision required); selection sends
+    only the candidate description texts (any chat model is enough). The two
+    roles can share one client or be split via separate resolvers.
+    """
+
+    def __init__(
+        self,
+        client_resolver: Callable[[], object],
+        selection_client_resolver: Callable[[], object] | None = None,
+    ):
         self._resolve_client = client_resolver
+        # Selection is text-only; without a dedicated resolver it falls back
+        # to the tagging client (single-model setups keep working).
+        self._resolve_selection_client = selection_client_resolver or client_resolver
 
     # ------------------------------------------------------------------
     # Client / request helpers
@@ -54,13 +66,18 @@ class EmojiVLM:
     def _client(self):
         client = self._resolve_client()
         if client is None:
-            raise RuntimeError("no VLM/LLM client available for emoji plugin")
+            raise RuntimeError("no VLM/LLM client available for emoji tagging")
         return client
 
-    async def _chat(self, content) -> str:
+    def _selection_client(self):
+        client = self._resolve_selection_client()
+        if client is None:
+            raise RuntimeError("no LLM client available for emoji selection")
+        return client
+
+    async def _chat(self, content, client) -> str:
         from core.provider import LLMRequest
 
-        client = self._client()
         request = LLMRequest(messages=[{"role": "user", "content": content}])
         resp = await client.chat(request)
         return resp.text_response or ""
@@ -83,7 +100,8 @@ class EmojiVLM:
             [
                 {"type": "image_url", "image_url": {"url": data_url, "detail": "low"}},
                 {"type": "text", "text": prompt},
-            ]
+            ],
+            client=self._client(),
         )
         parsed = self._parse_json_object(raw)
         description = str(parsed.get("description", "") or "")
@@ -118,7 +136,9 @@ class EmojiVLM:
             emoji_hint=emoji_hint,
             recent_context=recent_context or "(无)",
         )
-        raw = await self._chat([{"type": "text", "text": prompt}])
+        raw = await self._chat(
+            [{"type": "text", "text": prompt}], client=self._selection_client()
+        )
 
         try:
             parsed = self._parse_json_object(raw)

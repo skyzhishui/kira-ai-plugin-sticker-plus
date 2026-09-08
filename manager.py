@@ -467,8 +467,3 @@ class EmojiManager:
     async def stats(self) -> dict:
         async with self._db.session() as session:
             return await EmojiRepository(session).stats()
-
-    async def count_active(self) -> int:
-        """Selectable emoji count (cheap gate for guidance injection)."""
-        async with self._db.session() as session:
-            return await EmojiRepository(session).count_active()

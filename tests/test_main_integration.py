@@ -46,10 +46,18 @@ class FakeCtx:
     def __init__(self, data_dir, client):
         self._data_dir = data_dir
         self._client = client
-        self.provider_mgr = SimpleNamespace(get_default_vlm=lambda: client)
+        self.provider_mgr = SimpleNamespace(
+            get_default_vlm=lambda: client,
+            get_default_llm=lambda: client,
+        )
+        self.requested_model_uuids: list[str] = []
 
     def get_plugin_data_dir(self):
         return str(self._data_dir)
+
+    def get_llm_client(self, model_uuid):
+        self.requested_model_uuids.append(str(model_uuid))
+        return self._client
 
 
 @pytest_asyncio.fixture
@@ -129,20 +137,42 @@ async def test_steal_hook_rejects_non_image(plugin):
     assert total == 0
 
 
-def _guidance_req():
-    return SimpleNamespace(system_prompt=[SimpleNamespace(name="tools", content="base")])
+@pytest.mark.asyncio
+async def test_steal_disabled_short_circuits_hook(plugin):
+    # Toggle off -> the hook returns before any extraction/intake/tagging.
+    plugin.plugin_cfg["steal_emoji"] = False
+    try:
+        event = SimpleNamespace(
+            message=SimpleNamespace(
+                chain=[Sticker(sticker=b64(make_png_bytes(color=(55, 55, 55))))],
+                sender=SimpleNamespace(user_id="10001"),
+                self_id="99999",
+            )
+        )
+        await plugin.steal_emoji(event)
+        await plugin._stealer.shutdown()
+        _, total = await plugin._manager.list_emojis()
+        assert total == 0, "nothing may be stored while stealing is disabled"
+        assert not plugin._manager._bg_tasks, "no tagging may be scheduled"
+    finally:
+        plugin.plugin_cfg["steal_emoji"] = True
 
 
 @pytest.mark.asyncio
-async def test_guidance_injection_gated_on_active_library(plugin):
-    # empty library -> guidance stays out of the prompt
-    req = _guidance_req()
-    await plugin.inject_emoji_guidance(None, req, None)
-    assert req.system_prompt[0].content == "base"
+async def test_settings_expose_split_models(plugin):
+    settings = await plugin.get_settings()
+    assert settings["vlm_model"] == ""
+    assert settings["selection_model"] == ""
 
-    assert await plugin._manager.add_emoji_from_bytes(make_png_bytes(color=(21, 21, 21)), "manual")
-    if plugin._manager._bg_tasks:
-        await asyncio.gather(*list(plugin._manager._bg_tasks), return_exceptions=True)
-    req = _guidance_req()
-    await plugin.inject_emoji_guidance(None, req, None)
-    assert "send_emoji" in req.system_prompt[0].content
+
+@pytest.mark.asyncio
+async def test_configured_models_route_via_get_llm_client(plugin):
+    plugin.plugin_cfg["vlm_model"] = "tag-uuid"
+    plugin.plugin_cfg["selection_model"] = "select-uuid"
+    try:
+        assert plugin._resolve_vlm_client() is not None
+        assert plugin._resolve_selection_client() is not None
+        assert set(plugin.ctx.requested_model_uuids) == {"tag-uuid", "select-uuid"}
+    finally:
+        plugin.plugin_cfg.pop("vlm_model", None)
+        plugin.plugin_cfg.pop("selection_model", None)

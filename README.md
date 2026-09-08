@@ -38,7 +38,8 @@ WebUI 插件配置页可视化编辑：
 | `capacity` | `500` | 图库容量上限，满额淘汰低使用量表情 |
 | `candidate_count` | `9` | 每次 send_emoji 的 VLM 候选数 |
 | `max_emoji_size_mb` | `5.0` | 偷取单图大小上限（MB） |
-| `vlm_model` | 空 | 打标/选图模型，留空用系统默认 VLM（打标需视觉能力） |
+| `vlm_model` | 空 | 打标模型（图片输入，需视觉能力），留空用系统默认 VLM |
+| `selection_model` | 空 | 选图模型（send_emoji 从候选描述中挑选，纯文本任务无需视觉），留空用系统默认 LLM |
 
 ## 数据与重置
 

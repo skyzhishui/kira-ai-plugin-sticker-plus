@@ -48,16 +48,6 @@ EMOTION_KEYWORDS = (
     "期待、生气、无辜、撒娇、嫌弃、嘲讽、感谢、安慰、悲伤、欢迎"
 )
 
-USAGE_GUIDANCE = (
-    "表情包使用规范（send_emoji 工具）：\n"
-    "- 你可以在聊天中主动、自然地使用表情包，通常作为单独一条消息发送，或紧跟在文字之后点缀情绪\n"
-    "- 保持克制：优先用文字回应，连续多轮都发表情会显得敷衍；一轮回复最多调用一次 send_emoji\n"
-    "- 被@或被直接提问时，必须以文字回应为主，表情包只能作为补充\n"
-    "- emotion 参数从固定情绪词表中选择最贴切当前语境的一个\n"
-    f"- 可选情绪词：{EMOTION_KEYWORDS}"
-)
-
-
 class EmojiUpdateRequest(BaseModel):
     description: Optional[str] = None
     emotions: Optional[str] = None
@@ -91,7 +81,10 @@ class StickerPlusPlugin(BasePlugin):
             self._db = EmojiDatabase(data_dir / "emoji.db")
             await self._db.create_tables()
 
-            vlm = EmojiVLM(client_resolver=self._resolve_vlm_client)
+            vlm = EmojiVLM(
+                client_resolver=self._resolve_vlm_client,
+                selection_client_resolver=self._resolve_selection_client,
+            )
             self._manager = EmojiManager(
                 db=self._db,
                 vlm=vlm,
@@ -134,14 +127,28 @@ class StickerPlusPlugin(BasePlugin):
             self._db = None
 
     def _resolve_vlm_client(self):
-        """Configured model wins, else the host default VLM; None on failure."""
+        """Tagging client: needs vision. Configured model wins, else the
+        host default VLM; None on failure (tagging retries later)."""
         model_uuid = str(self.plugin_cfg.get("vlm_model", "") or "").strip()
         try:
             if model_uuid:
                 return self.ctx.get_llm_client(model_uuid=model_uuid)
             return self.ctx.provider_mgr.get_default_vlm()
         except Exception as exc:
-            logger.error("Failed to resolve VLM client for emoji plugin: %s", exc)
+            logger.error("Failed to resolve tagging VLM client for emoji plugin: %s", exc)
+            return None
+
+    def _resolve_selection_client(self):
+        """Selection client: text-only choice task, no vision needed.
+        Configured model wins, else the host default LLM; None on failure
+        (the manager then falls back to random selection)."""
+        model_uuid = str(self.plugin_cfg.get("selection_model", "") or "").strip()
+        try:
+            if model_uuid:
+                return self.ctx.get_llm_client(model_uuid=model_uuid)
+            return self.ctx.provider_mgr.get_default_llm()
+        except Exception as exc:
+            logger.error("Failed to resolve selection LLM client for emoji plugin: %s", exc)
             return None
 
     # ------------------------------------------------------------------
@@ -153,8 +160,7 @@ class StickerPlusPlugin(BasePlugin):
         description=(
             "发送一个表情包消息。根据当前聊天语境选择一个情绪关键词，"
             "表情包会由系统自动挑选并随消息发出。"
-            f"emotion 可选值：{EMOTION_KEYWORDS}。"
-            "保持克制地自然使用，不要每轮都调用；单独作为一条消息或在文字后点缀。"
+            "可单独作为一条消息或与文字消息一起发送。"
         ),
         params={
             "type": "object",
@@ -200,23 +206,6 @@ class StickerPlusPlugin(BasePlugin):
     # ------------------------------------------------------------------
     # Hooks
     # ------------------------------------------------------------------
-
-    @on.llm_request()
-    async def inject_emoji_guidance(self, event: KiraMessageBatchEvent, req, tag_set, *args, **kwargs):
-        """Append emoji usage guidance to the tools prompt section."""
-        if self._manager is None:
-            return
-        try:
-            # Nothing selectable yet (empty library or everything pending):
-            # guidance would only invite a doomed send_emoji call.
-            if await self._manager.count_active() == 0:
-                return
-        except Exception:
-            return
-        for prompt in req.system_prompt:
-            if prompt.name == "tools":
-                prompt.content = f"{prompt.content}\n{USAGE_GUIDANCE}"
-                return
 
     @on.im_message()
     async def steal_emoji(self, event: KiraMessageEvent, *args, **kwargs):
@@ -365,6 +354,7 @@ class StickerPlusPlugin(BasePlugin):
             "candidate_count": manager.candidate_count,
             "max_emoji_size_mb": float(self.plugin_cfg.get("max_emoji_size_mb", 5.0)),
             "vlm_model": str(self.plugin_cfg.get("vlm_model", "") or ""),
+            "selection_model": str(self.plugin_cfg.get("selection_model", "") or ""),
             "stats": stats,
         }
 
