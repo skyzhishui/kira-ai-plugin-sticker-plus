@@ -42,6 +42,12 @@ class EmojiImage(Base):
     )
     use_count: Mapped[int] = mapped_column(Integer, default=0)
     is_banned: Mapped[bool] = mapped_column(Boolean, default=False)
+    needs_review: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        server_default="0",
+        comment="Banned at intake pending manual approval (stolen emoji review flow)",
+    )
     vlm_processed: Mapped[bool] = mapped_column(Boolean, default=False)
     tag_fail_count: Mapped[int] = mapped_column(
         Integer, default=0, server_default="0",
@@ -66,6 +72,7 @@ class EmojiImage(Base):
             "source": self.source,
             "use_count": self.use_count,
             "is_banned": bool(self.is_banned),
+            "needs_review": bool(self.needs_review),
             "vlm_processed": bool(self.vlm_processed),
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "last_used_at": self.last_used_at.isoformat() if self.last_used_at else None,

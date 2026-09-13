@@ -141,6 +141,41 @@ async def test_tagging_failures_auto_ban(env):
 
 
 @pytest.mark.asyncio
+async def test_stolen_requires_approval_flow(tmp_path):
+    """Approval toggle: stolen rows land banned, get tagged, need manual enable."""
+    db = EmojiDatabase(tmp_path / "test.db")
+    await db.create_tables()
+    manager = EmojiManager(
+        db=db, vlm=FakeTagVLM(), emoji_dir=tmp_path / "emojis",
+        capacity=50, candidate_count=9, steal_require_approval=True,
+    )
+    try:
+        assert await manager.add_emoji_from_bytes(make_png_bytes(color=(9, 9, 9)), "stolen")
+        # manual source is exempt from the review flow
+        assert await manager.add_emoji_from_bytes(make_png_bytes(color=(10, 10, 10)), "manual")
+        await manager._tag_pending_background()
+        rows, total = await manager.list_emojis()
+        assert total == 2
+        by_source = {r["source"]: r for r in rows}
+        assert by_source["stolen"]["is_banned"] is True
+        assert by_source["stolen"]["needs_review"] is True
+        assert by_source["stolen"]["vlm_processed"] is True  # tagged while banned
+        assert by_source["manual"]["is_banned"] is False
+        # banned review row is not selectable...
+        picked = await manager.pick_emoji("开心", "")
+        assert picked is not None and picked[0].path != by_source["stolen"]["path"]
+        # ...until manually enabled
+        await manager.update_emoji(by_source["stolen"]["id"], is_banned=False)
+        enabled = await manager.get_emoji(by_source["stolen"]["id"])
+        assert enabled["is_banned"] is False and enabled["needs_review"] is False
+        stats = await manager.stats()
+        assert stats["review"] == 0 and stats["active"] == 2
+    finally:
+        await manager.shutdown()
+        await db.dispose()
+
+
+@pytest.mark.asyncio
 async def test_retag_rewrites_row(env):
     data = make_png_bytes(color=(11, 11, 11))
     await env.add_emoji_from_bytes(data, "stolen")

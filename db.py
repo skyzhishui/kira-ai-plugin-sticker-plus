@@ -79,6 +79,13 @@ class EmojiDatabase:
                             "ADD COLUMN tag_fail_count INTEGER NOT NULL DEFAULT 0"
                         )
                     )
+                if "needs_review" not in existing:
+                    sync_conn.execute(
+                        text(
+                            "ALTER TABLE emoji_images "
+                            "ADD COLUMN needs_review BOOLEAN NOT NULL DEFAULT 0"
+                        )
+                    )
 
             await conn.run_sync(_add_missing_columns)
 

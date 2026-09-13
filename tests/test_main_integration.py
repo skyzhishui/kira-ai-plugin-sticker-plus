@@ -1,8 +1,9 @@
 """Integration smoke test: full plugin flow with a fake host context.
 
-Exercises: initialize() -> intake -> VLM tagging -> send_emoji tool ->
-steal hook -> terminate(), all against the real main.StickerPlusPlugin with a
-minimal fake PluginContext and a scripted fake LLM client.
+Exercises: initialize() -> intake -> VLM tagging -> <sticker_plus> tag
+schedule + direct send -> step-result record injection -> steal hook ->
+terminate(), all against the real main.StickerPlusPlugin with a minimal fake
+PluginContext and a scripted fake LLM client.
 """
 
 from __future__ import annotations
@@ -19,6 +20,23 @@ from core.chat.message_elements import Sticker
 from helpers import b64, make_png_bytes
 
 main_mod = importlib.import_module("kira-ai-plugin-sticker-plus.main")
+
+
+SID = "qq:dm:10001"
+
+
+def make_batch_event(text: str = "今天真开心呀，哈哈", sid: str = SID, message_types=None):
+    """Minimal stand-in for a KiraMessageBatchEvent."""
+    return SimpleNamespace(
+        sid=sid,
+        message_types=message_types if message_types is not None else ["text", "sticker"],
+        messages=[SimpleNamespace(message_str=text)],
+    )
+
+
+def make_step_result(raw: str):
+    """Minimal stand-in for KiraStepResult (raw_output is rewritten by the hook)."""
+    return SimpleNamespace(raw_output=raw)
 
 
 class PromptAwareClient:
@@ -51,6 +69,9 @@ class FakeCtx:
             get_default_llm=lambda: client,
         )
         self.requested_model_uuids: list[str] = []
+        # Records direct sends as (sid, chain); result scripted per test.
+        self.sent_chains: list[tuple[str, object]] = []
+        self.send_result = SimpleNamespace(ok=True, err="", message_id="msg-1")
 
     def get_plugin_data_dir(self):
         return str(self._data_dir)
@@ -58,6 +79,20 @@ class FakeCtx:
     def get_llm_client(self, model_uuid):
         self.requested_model_uuids.append(str(model_uuid))
         return self._client
+
+    async def send_message_chain(self, sid, chain):
+        self.sent_chains.append((sid, chain))
+        return self.send_result
+
+
+async def add_tagged_emojis(plugin, count: int = 2) -> None:
+    """Intake emojis and settle their background VLM tagging tasks."""
+    for i in range(count):
+        assert await plugin._manager.add_emoji_from_bytes(
+            make_png_bytes(color=(7 + i, 7 + i, 7 + i)), "manual"
+        )
+    if plugin._manager._bg_tasks:
+        await asyncio.gather(*list(plugin._manager._bg_tasks), return_exceptions=True)
 
 
 @pytest_asyncio.fixture
@@ -73,32 +108,51 @@ async def plugin(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_send_emoji_flow(plugin):
-    # intake two emojis; background tagging tasks fire per add
-    assert await plugin._manager.add_emoji_from_bytes(make_png_bytes(color=(7, 7, 7)), "manual")
-    assert await plugin._manager.add_emoji_from_bytes(make_png_bytes(color=(8, 8, 8)), "manual")
-    # let background tagging settle (serialized by the manager's tag lock)
-    if plugin._manager._bg_tasks:
-        await asyncio.gather(*list(plugin._manager._bg_tasks), return_exceptions=True)
-    stats = await plugin._manager.stats()
-    assert stats["active"] == 2
+async def test_tag_injection_gated_by_message_types(plugin):
+    from core.tag import TagSet
 
-    event = SimpleNamespace(
-        messages=[SimpleNamespace(message_str="今天真开心呀，哈哈")]
+    event = make_batch_event()
+    tag_set = TagSet()
+    await plugin.inject_sticker_plus_tag(event, None, tag_set)
+    assert "sticker_plus" in tag_set
+    tag = tag_set.get("sticker_plus")
+    assert tag is not None and tag.name == "sticker_plus"
+
+    # Adapters without sticker message types must not get the tag.
+    empty_tag_set = TagSet()
+    await plugin.inject_sticker_plus_tag(
+        make_batch_event(message_types=["text"]), None, empty_tag_set
     )
-    result = await plugin.send_emoji(event, emotion="开心")
+    assert "sticker_plus" not in empty_tag_set
 
-    assert isinstance(result, main_mod.ToolResult)
-    assert not result.attachments, "the <sticker> tag carries the image now"
-    assert "<sticker>" in result.text and "</sticker>" in result.text
-    # the referenced id must resolve through the sticker tag
-    emoji_id = int(result.text.split("<sticker>")[1].split("</sticker>")[0])
-    elements = await plugin.sticker_tag(str(emoji_id))
-    assert len(elements) == 1
-    from core.chat.message_elements import Sticker as StickerElement
-    assert isinstance(elements[0], StickerElement)
-    assert elements[0].sticker_id == str(emoji_id)
-    assert elements[0].file_type == "base64" and elements[0].file
+
+@pytest.mark.asyncio
+async def test_sticker_plus_flow(plugin):
+    await add_tagged_emojis(plugin)
+
+    event = make_batch_event()
+    tag = plugin._build_sticker_plus_tag(event)
+    # The tag handle must never block the reply: returns [] immediately.
+    assert await tag.handle("开心") == []
+
+    # The step-result hook waits for the background send and appends the record.
+    raw = "<msg>\n    <text>哈哈</text>\n    <sticker_plus>开心</sticker_plus>\n</msg>"
+    step_result = make_step_result(raw)
+    await plugin.attach_sticker_send_record(event, step_result)
+
+    # Direct send happened through the adapter path with one Sticker element.
+    assert len(plugin.ctx.sent_chains) == 1
+    sent_sid, chain = plugin.ctx.sent_chains[0]
+    assert sent_sid == SID
+    assert len(chain) == 1 and isinstance(chain[0], Sticker)
+
+    # History record: system_reminder appended after the AI's own message.
+    assert step_result.raw_output.startswith(raw)
+    assert "已随本条消息发送表情包：编号" in step_result.raw_output
+    assert "<system_reminder>已随本条消息发送表情包：" in step_result.raw_output
+    assert "</system_reminder>" in step_result.raw_output
+    # Pending bucket drained.
+    assert SID not in plugin._pending_sends
 
     # Regression: the selection prompt must carry the triggering batch text
     # (built from event.messages[].message_str, not the never-set batch field).
@@ -113,19 +167,117 @@ async def test_send_emoji_flow(plugin):
 
 
 @pytest.mark.asyncio
-async def test_sticker_tag_rejects_bad_input(plugin):
-    assert await plugin.sticker_tag("not-a-number") == []
-    assert await plugin.sticker_tag("999999") == []
-    assert await plugin.sticker_tag(" 12 ") == []  # numeric but absent
+async def test_sticker_plus_send_failure_recorded(plugin):
+    await add_tagged_emojis(plugin, count=1)
+    plugin.ctx.send_result = SimpleNamespace(ok=False, err="boom", message_id=None)
+
+    event = make_batch_event()
+    tag = plugin._build_sticker_plus_tag(event)
+    await tag.handle("开心")
+
+    step_result = make_step_result("<msg><sticker_plus>开心</sticker_plus></msg>")
+    await plugin.attach_sticker_send_record(event, step_result)
+    assert "本次表情包未发送：发送失败：boom" in step_result.raw_output
 
 
 @pytest.mark.asyncio
-async def test_send_emoji_empty_hint(plugin):
-    result = await plugin.send_emoji(
-        SimpleNamespace(messages=[SimpleNamespace(message_str="x")]), emotion=""
+async def test_sticker_plus_no_candidate_recorded(plugin):
+    # Empty library: pick_emoji returns None -> explicit "not sent" record.
+    event = make_batch_event()
+    tag = plugin._build_sticker_plus_tag(event)
+    await tag.handle("开心")
+
+    step_result = make_step_result("<msg><sticker_plus>开心</sticker_plus></msg>")
+    await plugin.attach_sticker_send_record(event, step_result)
+    assert "本次表情包未发送：表情包库中没有合适的表情" in step_result.raw_output
+    assert not plugin.ctx.sent_chains
+
+
+@pytest.mark.asyncio
+async def test_sticker_plus_timeout_keeps_silence(plugin, monkeypatch):
+    monkeypatch.setattr(main_mod, "SEND_RECORD_WAIT_TIMEOUT", 0.05)
+    release = asyncio.Event()
+
+    async def hanging_pick(emoji_hint, recent_context=""):
+        await release.wait()
+        return None
+
+    plugin._manager.pick_emoji = hanging_pick
+
+    event = make_batch_event()
+    tag = plugin._build_sticker_plus_tag(event)
+    await tag.handle("开心")
+
+    raw = "<msg><sticker_plus>开心</sticker_plus></msg>"
+    step_result = make_step_result(raw)
+    await plugin.attach_sticker_send_record(event, step_result)
+    assert step_result.raw_output == raw, "timed-out sends must not produce a record"
+    assert SID not in plugin._pending_sends
+
+    # Let the background task finish cleanly so no task leaks past the test.
+    release.set()
+    if plugin._bg_sends:
+        await asyncio.gather(*list(plugin._bg_sends), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_sticker_plus_multiple_tags_multiple_records(plugin):
+    await add_tagged_emojis(plugin, count=2)
+
+    event = make_batch_event()
+    tag = plugin._build_sticker_plus_tag(event)
+    await tag.handle("开心")
+    await tag.handle("害羞")
+
+    step_result = make_step_result(
+        "<msg><text>嗨</text><sticker_plus>开心</sticker_plus></msg>"
+        "<msg><sticker_plus>害羞</sticker_plus></msg>"
     )
-    assert isinstance(result, main_mod.ToolResult)
-    assert not result.attachments
+    await plugin.attach_sticker_send_record(event, step_result)
+    assert step_result.raw_output.count("<system_reminder>已随本条消息发送表情包：") == 2
+    assert len(plugin.ctx.sent_chains) == 2
+
+
+@pytest.mark.asyncio
+async def test_sticker_plus_gate_requires_tag_in_output(plugin):
+    await add_tagged_emojis(plugin, count=1)
+
+    event = make_batch_event()
+    tag = plugin._build_sticker_plus_tag(event)
+    await tag.handle("开心")
+
+    # A step without the tag (e.g. a tool-call step) must stay untouched and
+    # must not drain the pending bucket.
+    step_result = make_step_result("<msg><text>普通消息</text></msg>")
+    await plugin.attach_sticker_send_record(event, step_result)
+    assert step_result.raw_output == "<msg><text>普通消息</text></msg>"
+    assert SID in plugin._pending_sends, "pending entry must survive for the real step"
+
+    # The real text step then drains it and appends the record.
+    text_step = make_step_result("<msg><sticker_plus>开心</sticker_plus></msg>")
+    await plugin.attach_sticker_send_record(event, text_step)
+    assert "已随本条消息发送表情包：" in text_step.raw_output
+
+
+@pytest.mark.asyncio
+async def test_sticker_plus_empty_emotion_skipped(plugin):
+    event = make_batch_event()
+    tag = plugin._build_sticker_plus_tag(event)
+    assert await tag.handle("   ") == []
+    assert not plugin._pending_sends
+    assert not plugin.ctx.sent_chains
+
+
+@pytest.mark.asyncio
+async def test_sticker_plus_library_unavailable_skipped(plugin):
+    plugin._manager = None
+    try:
+        event = make_batch_event()
+        tag = plugin._build_sticker_plus_tag(event)
+        assert await tag.handle("开心") == []
+        assert not plugin._pending_sends
+    finally:
+        await plugin.initialize()  # restore a working manager for teardown
 
 
 @pytest.mark.asyncio
@@ -145,6 +297,9 @@ async def test_steal_hook_stores_sticker(plugin):
     items, total = await plugin._manager.list_emojis()
     assert total == 1
     assert items[0]["source"] == "stolen"
+    # default config: stolen emojis land banned pending manual review
+    assert items[0]["is_banned"] is True
+    assert items[0]["needs_review"] is True
 
 
 @pytest.mark.asyncio
@@ -189,6 +344,9 @@ async def test_settings_expose_split_models(plugin):
     settings = await plugin.get_settings()
     assert settings["vlm_model"] == ""
     assert settings["selection_model"] == ""
+    # approval toggle defaults to on (stolen emojis land disabled)
+    assert settings["steal_require_approval"] is True
+    assert plugin._manager._steal_require_approval is True
 
 
 @pytest.mark.asyncio

@@ -173,6 +173,50 @@ async def test_record_tag_failure_bans_after_max(db):
 
 
 @pytest.mark.asyncio
+async def test_needs_review_flow(db):
+    """Stolen review rows: pre-banned but kept in the tag queue until settled."""
+    async with db.session() as session:
+        repo = EmojiRepository(session)
+        review = await repo.add("a" * 64, "a.png", "stolen", needs_review=True)
+        dead = await repo.add("b" * 64, "b.png", "manual")
+        await repo.ban(dead.id)  # e.g. missing file -> permanent ban
+        await session.commit()
+        assert review.is_banned is True and review.needs_review is True
+        # review row stays queued for tagging, permanently banned row does not
+        queued = await repo.get_unprocessed(limit=10)
+        assert [e.path for e in queued] == ["a.png"]
+
+    async with db.session() as session:
+        repo = EmojiRepository(session)
+        rows, total = await repo.list_emojis(status="review")
+        assert total == 1 and rows[0].path == "a.png"
+        stats = await repo.stats()
+        assert stats["review"] == 1 and stats["banned"] == 2
+        # still tagged while awaiting review (reviewer needs the description)
+        await repo.tag(rows[0].id, "a cat", "开心")
+        # manual enable settles the review state
+        enabled = await repo.update_fields(rows[0].id, is_banned=False)
+        await session.commit()
+        assert enabled.is_banned is False and enabled.needs_review is False
+        picks = await repo.pick_random(limit=5)
+        assert [p.path for p in picks] == ["a.png"]
+
+
+@pytest.mark.asyncio
+async def test_tag_failure_cap_clears_review_flag(db):
+    """A review row that keeps failing tagging settles as permanently banned."""
+    async with db.session() as session:
+        repo = EmojiRepository(session)
+        emoji = await repo.add("a" * 64, "a.png", "stolen", needs_review=True)
+        await repo.record_tag_failure(emoji.id, 3)
+        await repo.record_tag_failure(emoji.id, 3)
+        assert await repo.record_tag_failure(emoji.id, 3) is True
+        assert emoji.is_banned is True and emoji.needs_review is False
+        assert await repo.get_unprocessed(limit=10) == []
+        await session.commit()
+
+
+@pytest.mark.asyncio
 async def test_evict_tiebreak_prefers_oldest_created(db):
     from datetime import datetime, timedelta
 
@@ -206,4 +250,4 @@ async def test_stats(db):
     ])
     async with db.session() as session:
         stats = await EmojiRepository(session).stats()
-    assert stats == {"total": 3, "active": 1, "pending": 1, "banned": 1, "stolen": 1}
+    assert stats == {"total": 3, "active": 1, "pending": 1, "banned": 1, "review": 0, "stolen": 1}

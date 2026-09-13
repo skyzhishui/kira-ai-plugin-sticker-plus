@@ -58,12 +58,14 @@ class EmojiManager:
         emoji_dir: Path,
         capacity: int = 500,
         candidate_count: int = 9,
+        steal_require_approval: bool = False,
     ):
         self._db = db
         self._vlm = vlm
         self._emoji_dir = emoji_dir
         self._capacity = max(int(capacity), 1)
         self._candidate_count = max(int(candidate_count), 1)
+        self._steal_require_approval = bool(steal_require_approval)
         self._bg_tasks: set[asyncio.Task] = set()
         self._tag_lock = asyncio.Lock()
 
@@ -175,8 +177,11 @@ class EmojiManager:
             repo = EmojiRepository(session)
             if await repo.find_by_hash(file_hash) is not None:
                 return False
+            # Review flow: stolen emojis land pre-banned when the toggle is
+            # on; the tagger still processes them so reviewers see descriptions.
+            needs_review = source == "stolen" and self._steal_require_approval
             try:
-                await repo.add(file_hash, file_name, source)
+                await repo.add(file_hash, file_name, source, needs_review=needs_review)
                 await session.commit()
             except IntegrityError:
                 await session.rollback()
@@ -189,7 +194,10 @@ class EmojiManager:
             # DB row stays; missing files are banned during tagging.
             logger.warning("Failed to write emoji file %s: %s", file_path, exc)
 
-        logger.info("Emoji added to library: hash=%s... source=%s", file_hash[:8], source)
+        logger.info(
+            "Emoji added to library: hash=%s... source=%s%s",
+            file_hash[:8], source, " (pending review)" if needs_review else "",
+        )
         self._spawn(self._tag_pending_background())
 
         await self._evict_if_full()
