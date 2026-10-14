@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .models import EmojiImage
@@ -27,14 +27,22 @@ class EmojiRepository:
     # Write operations (caller commits)
     # ------------------------------------------------------------------
 
-    async def add(self, file_hash: str, path: str, source: str) -> EmojiImage:
-        """Create an untagged emoji record; flush so ``id`` is available."""
+    async def add(
+        self, file_hash: str, path: str, source: str, needs_review: bool = False
+    ) -> EmojiImage:
+        """Create an untagged emoji record; flush so ``id`` is available.
+
+        needs_review=True creates the row pre-banned pending manual approval
+        (stolen-emoji review flow) - it is still tagged by the background
+        pipeline so the reviewer sees a description.
+        """
         emoji = EmojiImage(
             hash=file_hash,
             path=path,
             source=source,
             use_count=0,
-            is_banned=False,
+            is_banned=needs_review,
+            needs_review=needs_review,
             vlm_processed=False,
         )
         self._session.add(emoji)
@@ -64,6 +72,8 @@ class EmojiRepository:
         emoji.tag_fail_count = int(emoji.tag_fail_count or 0) + 1
         if emoji.tag_fail_count >= max_failures:
             emoji.is_banned = True
+            # Settled as permanently broken: also leaves the review queue.
+            emoji.needs_review = False
             return True
         return False
 
@@ -90,6 +100,8 @@ class EmojiRepository:
             emoji.vlm_processed = True
         if is_banned is not None:
             emoji.is_banned = bool(is_banned)
+            # A human decision settles the review state in either direction.
+            emoji.needs_review = False
         await self._session.flush()
         return emoji
 
@@ -111,9 +123,11 @@ class EmojiRepository:
         emoji.last_used_at = datetime.now()
 
     async def ban(self, emoji_id: int) -> None:
+        """Permanently ban (missing file etc.) - leaves the review queue too."""
         emoji = await self._session.get(EmojiImage, emoji_id)
         if emoji is not None:
             emoji.is_banned = True
+            emoji.needs_review = False
 
     # ------------------------------------------------------------------
     # Read operations
@@ -220,7 +234,7 @@ class EmojiRepository:
     ) -> tuple[list[EmojiImage], int]:
         """Paged listing for the WebUI.
 
-        status: all | active | banned | pending | stolen
+        status: all | active | banned | pending | stolen | review
         search: substring match on description / emotions / hash prefix.
         """
         conditions = []
@@ -232,6 +246,10 @@ class EmojiRepository:
             conditions.append(EmojiImage.vlm_processed.is_(False))
         elif status == "stolen":
             conditions.append(EmojiImage.source == "stolen")
+        elif status == "review":
+            conditions.append(
+                and_(EmojiImage.is_banned.is_(True), EmojiImage.needs_review.is_(True))
+            )
         if search:
             like = f"%{search}%"
             conditions.append(
@@ -269,18 +287,26 @@ class EmojiRepository:
             ),
             "pending": await _count(EmojiImage.vlm_processed.is_(False)),
             "banned": await _count(EmojiImage.is_banned.is_(True)),
+            "review": await _count(
+                EmojiImage.is_banned.is_(True), EmojiImage.needs_review.is_(True)
+            ),
             "stolen": await _count(EmojiImage.source == "stolen"),
         }
 
     async def get_unprocessed(self, limit: int = 50) -> list[EmojiImage]:
-        """Untagged, not-banned emojis for the background tagger (oldest first).
+        """Untagged emojis for the background tagger (oldest first).
 
-        Banned rows are excluded: missing files and repeated tagging failures
-        get banned, and they must stop occupying queue slots.
+        Rows banned as permanently broken (missing files, repeated tagging
+        failures) are excluded so they stop occupying queue slots. Rows
+        banned only because they await manual review keep their place:
+        the reviewer needs the VLM description to decide.
         """
         result = await self._session.execute(
             select(EmojiImage)
-            .where(EmojiImage.vlm_processed.is_(False), EmojiImage.is_banned.is_(False))
+            .where(
+                EmojiImage.vlm_processed.is_(False),
+                or_(EmojiImage.is_banned.is_(False), EmojiImage.needs_review.is_(True)),
+            )
             .order_by(EmojiImage.created_at)
             .limit(limit)
         )

@@ -106,11 +106,16 @@
   <div class="stat"><span class="lbl">总数</span><span class="num" id="st-total">-</span></div>
   <div class="stat"><span class="lbl">可用</span><span class="num" id="st-active">-</span></div>
   <div class="stat"><span class="lbl">待打标</span><span class="num" id="st-pending">-</span></div>
+  <div class="stat"><span class="lbl">待审核</span><span class="num" id="st-review">-</span></div>
   <div class="stat"><span class="lbl">已禁用</span><span class="num" id="st-banned">-</span></div>
   <div class="stat"><span class="lbl">偷取</span><span class="num" id="st-stolen">-</span></div>
   <div class="spacer"></div>
   <div class="switch" id="steal-switch" title="自动收藏聊天中他人发送的表情包">
     <span class="sw-label">偷取表情</span>
+    <div class="track"><i></i></div>
+  </div>
+  <div class="switch" id="steal-approval-switch" title="开启后偷取的表情包入库即为禁用状态，需手动启用后才会被 AI 使用">
+    <span class="sw-label">偷取需审核</span>
     <div class="track"><i></i></div>
   </div>
   <button class="ghost" id="btn-rescan">重新扫描</button>
@@ -125,6 +130,7 @@
   <div class="tab" data-status="pending">待打标</div>
   <div class="tab" data-status="banned">已禁用</div>
   <div class="tab" data-status="stolen">偷取的</div>
+  <div class="tab" data-status="review">待审核</div>
   <div class="search">
     <input type="text" id="search" placeholder="搜索描述/标签/哈希" style="width:190px">
     <button class="ghost small" id="btn-search">搜索</button>
@@ -188,11 +194,15 @@ async function loadSettings() {
     $("st-total").textContent = s.stats.total;
     $("st-active").textContent = s.stats.active;
     $("st-pending").textContent = s.stats.pending;
+    $("st-review").textContent = s.stats.review;
     $("st-banned").textContent = s.stats.banned;
     $("st-stolen").textContent = s.stats.stolen;
     const sw = $("steal-switch");
     sw.classList.toggle("on", !!s.steal_emoji);
     sw.dataset.on = s.steal_emoji ? "1" : "0";
+    const ap = $("steal-approval-switch");
+    ap.classList.toggle("on", !!s.steal_require_approval);
+    ap.dataset.on = s.steal_require_approval ? "1" : "0";
   } catch (e) {
     toast("读取设置失败: " + e.message, true);
   }
@@ -206,6 +216,21 @@ async function toggleSteal() {
     sw.dataset.on = r.steal_emoji ? "1" : "0";
     sw.classList.toggle("on", !!r.steal_emoji);
     toast(r.steal_emoji ? "偷取表情已开启" : "偷取表情已关闭");
+  } catch (e) {
+    toast("切换失败: " + e.message, true);
+  }
+}
+
+async function toggleStealApproval() {
+  const sw = $("steal-approval-switch");
+  const target = sw.dataset.on !== "1";
+  try {
+    const r = await call("PUT", "/settings/steal-approval", { steal_require_approval: target });
+    sw.dataset.on = r.steal_require_approval ? "1" : "0";
+    sw.classList.toggle("on", !!r.steal_require_approval);
+    toast(r.steal_require_approval
+      ? "偷取表情将入库为禁用状态，需手动启用"
+      : "偷取表情将直接入库启用");
   } catch (e) {
     toast("切换失败: " + e.message, true);
   }
@@ -250,8 +275,12 @@ function renderGrid(items) {
     const card = document.createElement("div");
     card.className = "card" + (it.is_banned ? " banned" : "");
     const badges = [];
-    badges.push('<span class="badge ' + (it.is_banned ? "bad" : "ok") + '">#' + it.id +
-      (it.is_banned ? " 已禁用" : "") + "</span>");
+    if (it.needs_review) {
+      badges.push('<span class="badge warn">#' + it.id + " 待审核</span>");
+    } else {
+      badges.push('<span class="badge ' + (it.is_banned ? "bad" : "ok") + '">#' + it.id +
+        (it.is_banned ? " 已禁用" : "") + "</span>");
+    }
     if (!it.vlm_processed) badges.push('<span class="badge warn">待打标</span>');
     badges.push('<span class="badge">' + (it.source === "stolen" ? "偷取" : "手动") + "</span>");
     badges.push('<span class="badge">' + it.use_count + " 次</span>");
@@ -426,6 +455,7 @@ $("btn-rescan").addEventListener("click", rescan);
 $("btn-upload").addEventListener("click", () => $("file-input").click());
 $("file-input").addEventListener("change", e => { uploadFiles([...e.target.files]); e.target.value = ""; });
 $("steal-switch").addEventListener("click", toggleSteal);
+$("steal-approval-switch").addEventListener("click", toggleStealApproval);
 
 // Boot: wait for the bridge (cookie auth flows automatically with fetch/img)
 function boot() { loadSettings(); load(); }

@@ -11,6 +11,18 @@
       }
     }
   },
+  "steal_require_approval": {
+    "type": "switch",
+    "name": "Stolen emojis require approval",
+    "default": true,
+    "hint": "When on, stolen emojis land in the library disabled and must be enabled manually on the plugin page before the AI can use them. They are still auto-tagged so you can review descriptions. Can also be toggled on the plugin page.",
+    "locales": {
+      "zh": {
+        "name": "偷取表情需审核",
+        "hint": "开启后偷取的表情包入库即为禁用状态，需在插件管理页手动启用后 AI 才会使用；入库后仍会自动打标以便审核。也可在插件管理页开关。"
+      }
+    }
+  },
   "capacity": {
     "type": "integer",
     "name": "Library capacity",
@@ -27,11 +39,11 @@
     "type": "integer",
     "name": "Candidate count",
     "default": 9,
-    "hint": "How many candidates are sampled for VLM to choose from on each send_emoji call.",
+    "hint": "How many candidates are sampled for the selection LLM to choose from on each send.",
     "locales": {
       "zh": {
         "name": "候选数量",
-        "hint": "每次 send_emoji 时采样多少张候选表情包给 VLM 挑选。"
+        "hint": "每次发送表情包时采样多少张候选表情包给选图模型挑选。"
       }
     }
   },
@@ -65,23 +77,23 @@
     "name": "Selection model (text-only)",
     "model_type": "llm",
     "default": "",
-    "hint": "Model used to pick one emoji from candidate descriptions on send_emoji. Text-only task, no vision needed - any chat model works. Empty = host default LLM.",
+    "hint": "Model used to pick one emoji from candidate descriptions on each send. Text-only task, no vision needed - any chat model works. Empty = host default LLM.",
     "locales": {
       "zh": {
         "name": "选图模型（纯文本）",
-        "hint": "send_emoji 时从候选描述中挑选一张的模型。纯文本任务，无需视觉能力，任意对话模型皆可。留空使用系统默认 LLM。"
+        "hint": "发送表情包时从候选描述中挑选一张的模型。纯文本任务，无需视觉能力，任意对话模型皆可。留空使用系统默认 LLM。"
       }
     }
   },
   "emotion_tag_info": {
     "type": "info",
     "name": "Emotion vocabulary",
-    "hint": "Emojis are tagged with a fixed vocabulary of 20 emotion labels: 胆怯、无语、调皮、开心、困惑、震惊、傲娇、害羞、温柔、委屈、期待、生气、无辜、撒娇、嫌弃、嘲讽、感谢、安慰、悲伤、欢迎。 The send_emoji tool asks the AI to pick one of them as the emotion keyword.",
+    "hint": "Emojis are tagged with a fixed vocabulary of 20 emotion labels: 胆怯、无语、调皮、开心、困惑、震惊、傲娇、害羞、温柔、委屈、期待、生气、无辜、撒娇、嫌弃、嘲讽、感谢、安慰、悲伤、欢迎。 The <sticker_plus> tag asks the AI to pick one of them as the emotion keyword.",
     "level": "info",
     "locales": {
       "zh": {
         "name": "情绪标签词表",
-        "hint": "表情包使用固定 20 类情绪标签打标：胆怯、无语、调皮、开心、困惑、震惊、傲娇、害羞、温柔、委屈、期待、生气、无辜、撒娇、嫌弃、嘲讽、感谢、安慰、悲伤、欢迎。send_emoji 工具让 AI 从中选一个情绪关键词。"
+        "hint": "表情包使用固定 20 类情绪标签打标：胆怯、无语、调皮、开心、困惑、震惊、傲娇、害羞、温柔、委屈、期待、生气、无辜、撒娇、嫌弃、嘲讽、感谢、安慰、悲伤、欢迎。<sticker_plus> 标签让 AI 从中选一个情绪关键词。"
       }
     }
   }
