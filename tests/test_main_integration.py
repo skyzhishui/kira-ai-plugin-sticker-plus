@@ -108,6 +108,28 @@ async def plugin(tmp_path):
     await inst.terminate()
 
 
+@pytest_asyncio.fixture(autouse=True)
+async def _clean_module_drainers():
+    """Drainer tasks are module-level state; never let them leak across tests.
+
+    A drainer left pending when a test's event loop closes would also never
+    run its done-callback, permanently polluting _active_drainers. Only
+    tasks on the current loop can be cancelled; ones from a closed loop are
+    dead already.
+    """
+    yield
+    loop = asyncio.get_running_loop()
+    live = [
+        t for t in main_mod._active_drainers
+        if not t.done() and t.get_loop() is loop
+    ]
+    for task in live:
+        task.cancel()
+    if live:
+        await asyncio.gather(*live, return_exceptions=True)
+    main_mod._active_drainers.clear()
+
+
 @pytest.mark.asyncio
 async def test_tag_injection_gated_by_supported_elements(plugin):
     from core.tag import TagSet
@@ -515,26 +537,28 @@ async def test_hot_reload_flag_does_not_outlive_the_update(plugin):
 
 
 @pytest.mark.asyncio
-async def test_hot_reload_depth_survives_concurrent_updates(plugin):
-    """并发设置请求：先完成的那个不得把另一个的短宽限退回长宽限。
+async def test_concurrent_settings_updates_are_serialized(plugin):
+    """并发设置请求：后端串行化，两个 update_plugin_config 不得交错。
 
-    Regression (neko review): a single instance-level bool meant the first
-    update to finish cleared the flag while another terminate was still
-    pending, so that request fell back to BG_SEND_SHUTDOWN_GRACE (15s).
+    Regression (neko review): the page-side settingsQueue only orders one
+    page's requests; two tabs / two clients (and the host replacing the
+    instance mid-update) could still interleave terminate/init. The backend
+    module-level lock must make the updates strictly sequential.
     """
-    seen = []
+    events = []
     gate = asyncio.Event()
 
-    class _SlowMgr:
+    class _RecordingMgr:
         def has_plugin(self, plugin_id):
             return True
 
         async def update_plugin_config(self, plugin_id, cfg):
-            seen.append(plugin._hot_reload_depth)
+            events.append(("enter", plugin_id))
             await gate.wait()
+            events.append(("exit", plugin_id))
             return cfg
 
-    plugin.ctx.plugin_mgr = _SlowMgr()
+    plugin.ctx.plugin_mgr = _RecordingMgr()
     try:
         t1 = asyncio.ensure_future(
             plugin.set_steal(main_mod.StealSettingRequest(steal_emoji=True))
@@ -545,10 +569,138 @@ async def test_hot_reload_depth_survives_concurrent_updates(plugin):
             )
         )
         await asyncio.sleep(0.05)
-        assert plugin._hot_reload_depth == 2, "both in-flight updates must be counted"
+        # The first update is parked inside the manager; the second must be
+        # waiting on the lock, not running alongside it.
+        assert events == [("enter", main_mod.PLUGIN_ID)], (
+            "second update started before the first finished"
+        )
         gate.set()
         await asyncio.gather(t1, t2)
         assert plugin._hot_reload_depth == 0
-        assert seen == [1, 2], "each update must observe its own depth"
+        assert events == [
+            ("enter", main_mod.PLUGIN_ID),
+            ("exit", main_mod.PLUGIN_ID),
+            ("enter", main_mod.PLUGIN_ID),
+            ("exit", main_mod.PLUGIN_ID),
+        ], "updates must run strictly one after the other"
     finally:
         del plugin.ctx.plugin_mgr
+
+
+@pytest.mark.asyncio
+async def test_settings_updates_serialized_across_instances(plugin):
+    """跨实例串行化：宿主在 update 内替换实例后，锁仍须生效。
+
+    Regression (neko review): the host rebuilds the plugin instance inside
+    update_plugin_config and rebinds the API routes to it, so an
+    instance-level lock would let a request routed to the fresh instance run
+    concurrently with the old instance's terminate/init. The lock is
+    module-level, so two instances' updates must not overlap either.
+    """
+    gate = asyncio.Event()
+    overlaps = []
+    active = 0
+
+    class _GatedMgr:
+        def has_plugin(self, plugin_id):
+            return True
+
+        async def update_plugin_config(self, plugin_id, cfg):
+            nonlocal active
+            active += 1
+            if active > 1:
+                overlaps.append("overlap")
+            try:
+                await gate.wait()
+                return cfg
+            finally:
+                active -= 1
+
+    other = main_mod.StickerPlusPlugin(plugin.ctx, dict(plugin.plugin_cfg))
+    plugin.ctx.plugin_mgr = _GatedMgr()
+    try:
+        # The old instance's update parks inside the manager (gate closed);
+        # the "fresh" instance's update must block on the module lock.
+        t1 = asyncio.ensure_future(
+            plugin.set_steal(main_mod.StealSettingRequest(steal_emoji=True))
+        )
+        await asyncio.sleep(0.05)
+        t2 = asyncio.ensure_future(
+            other.set_steal_approval(
+                main_mod.StealApprovalSettingRequest(steal_require_approval=False)
+            )
+        )
+        await asyncio.sleep(0.05)
+        assert overlaps == [], "updates on two instances ran concurrently"
+        gate.set()
+        r1, r2 = await asyncio.gather(t1, t2)
+        assert r1["steal_emoji"] is True
+        assert r2["steal_require_approval"] is False
+        assert not main_mod._active_drainers, "no drainer expected in this test"
+    finally:
+        del plugin.ctx.plugin_mgr
+        await other.terminate()
+
+
+@pytest.mark.asyncio
+async def test_hot_reload_defers_component_teardown_until_sends_settle(
+    plugin, monkeypatch
+):
+    """热重载短宽限到期后，组件必须延迟到在途发送结束再释放。
+
+    Regression (neko review): HOT_RELOAD_SEND_GRACE (2s) is shorter than a
+    slow pick, so on the settings-update path the teardown used to dispose
+    the manager/database while the send was still using them - recorded as a
+    bogus "internal error" failure. Now the components are detached and
+    released by a drainer only after the send settles.
+    """
+    monkeypatch.setattr(main_mod, "HOT_RELOAD_SEND_GRACE", 0.05)
+    monkeypatch.setattr(main_mod, "BG_SEND_SHUTDOWN_GRACE", 5.0)
+    pick_started = asyncio.Event()
+    release_pick = asyncio.Event()
+    shutdown_calls: list[float] = []
+    pick_done_at: list[float] = []
+    real_manager = plugin._manager
+
+    class _SlowPickManager:
+        """pick_emoji blocks until the test releases it."""
+
+        def __getattr__(self, name):
+            return getattr(real_manager, name)
+
+        async def pick_emoji(self, emotion, recent_context):
+            pick_started.set()
+            await release_pick.wait()
+            pick_done_at.append(time.monotonic())
+            # No candidate: enough to settle the pending record as "not sent".
+            return None
+
+        async def shutdown(self):
+            shutdown_calls.append(time.monotonic())
+            await real_manager.shutdown()
+
+    plugin._manager = _SlowPickManager()
+    plugin._schedule_sticker_send("开心", "让我看看", "chat-1")
+    assert await asyncio.wait_for(pick_started.wait(), timeout=2), "pick never started"
+
+    plugin._hot_reload_depth = 1
+    start = time.monotonic()
+    await plugin._shutdown_components()
+    elapsed = time.monotonic() - start
+    # The settings request unblocks after the short grace, not after the send.
+    assert elapsed < 2, f"shutdown blocked {elapsed:.2f}s behind a slow send"
+    assert shutdown_calls == [], "manager disposed while its send was still running"
+
+    # Let the send settle; the drainer must release the components after it.
+    release_pick.set()
+    drainers = set(main_mod._active_drainers)
+    assert drainers, "a drainer should own the detached components"
+    await asyncio.wait_for(asyncio.gather(*drainers), timeout=5)
+    assert len(shutdown_calls) == 1, "detached manager released exactly once"
+    assert pick_done_at, "pick must have completed"
+    assert shutdown_calls[0] >= pick_done_at[0], (
+        "components released before the send finished"
+    )
+    # The send was recorded as a graceful "no candidate", not an error.
+    bucket = plugin._pending_sends.get("chat-1", [])
+    assert not bucket, "pending records die at the hot-reload boundary"

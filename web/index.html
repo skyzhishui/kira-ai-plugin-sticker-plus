@@ -212,19 +212,23 @@ async function loadSettings() {
   }
 }
 
-// Switch toggles are guarded against re-entrancy, and all settings writes
-// are serialized.
+// Switch toggles are guarded against re-entrancy, and settings writes from
+// this page are serialized.
 //
 // Why both:
 // - busySwitches: a repeated click on the SAME switch while its request is
 //   in flight is ignored (the backend has no idempotency for the toggle).
-// - settingsQueue: the backend re-initializes the plugin instance on every
+// - settingsQueue: orders the two switches within THIS page only. It is a
+//   UX guard, not the real serialization: two tabs or two clients can still
+//   race, and the backend re-initializes the plugin instance on every
 //   PUT /settings/* (update_plugin_config -> init_plugin -> terminate +
-//   init), and the host does not serialize that per plugin: the terminate()
-//   path pops the instance AFTER an await, so two concurrent updates can
-//   interleave and one of them pops the freshly installed instance (the
-//   plugin goes missing during re-initialization). A shared queue keeps the
-//   two switches strictly sequential.
+//   init) without serializing that per plugin - the terminate() path pops
+//   the instance AFTER an await, so concurrent updates can interleave and
+//   one of them pops the freshly installed instance (the plugin goes
+//   missing during re-initialization). That root cause is closed by a
+//   module-level lock around the update in the backend handlers (see
+//   set_steal in main.py); this queue merely keeps this page's two toggles
+//   strictly sequential so their toasts and states settle in order.
 const busySwitches = new Set();
 let settingsQueue = Promise.resolve();
 

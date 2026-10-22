@@ -84,8 +84,56 @@ BG_SEND_SHUTDOWN_GRACE = 15.0
 # update_plugin_config -> init_plugin -> terminate on this instance). Kept
 # short on purpose: the HTTP request that triggered the update waits for it,
 # so a slow pick would otherwise block the management page for up to
-# BG_SEND_SHUTDOWN_GRACE per toggle (and the queue serializes two of them).
+# BG_SEND_SHUTDOWN_GRACE per toggle.
+#
+# The trade-off this implies (a pick often needs longer than this grace) is
+# handled by deferral, not by tearing resources out from under the send: when
+# sends are still running when the grace expires, the components they were
+# scheduled against are detached and handed to a background drainer task
+# (see _drain_detached_components) that releases them once the sends settle.
+# The settings request therefore unblocks after ~this grace while the sends
+# still finish against their own manager/database.
 HOT_RELOAD_SEND_GRACE = 2.0
+
+# Serializes PUT /settings/* across every instance of this plugin. The host
+# replaces the plugin instance inside update_plugin_config (init_plugin builds
+# a new object and rebinds the API routes to it), so an instance attribute
+# would not close the race: a second request routed to the fresh instance
+# would run concurrently with the first update's terminate/init. One process
+# has one live instance of this plugin, so one module-level lock serializes
+# all of them.
+#
+# The holder rebinding on loop change exists because asyncio.Lock caches the
+# loop of its first acquire and raises on any other. The host runs one loop
+# at a time (a new loop only appears after the old one is gone), so no holder
+# of the previous lock can still be alive when the lock is rebound - the
+# serialization is never weakened in practice.
+class _LoopLocalLock:
+    """An asyncio.Lock recreated when used from a different loop."""
+
+    def __init__(self) -> None:
+        self._lock: Optional[asyncio.Lock] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+
+    async def __aenter__(self) -> None:
+        loop = asyncio.get_running_loop()
+        if self._lock is None or self._loop is not loop:
+            self._lock = asyncio.Lock()
+            self._loop = loop
+        await self._lock.acquire()
+
+    async def __aexit__(self, *exc) -> None:
+        if self._lock is not None:
+            self._lock.release()
+
+
+_settings_update_lock = _LoopLocalLock()
+
+# Drainer tasks releasing components detached at a hot-reload boundary. Tracked
+# at module level because the instance that detached the components may itself
+# be replaced before the drain finishes; a later process shutdown waits for
+# these too, so detached sends still get their bounded grace.
+_active_drainers: set[asyncio.Task] = set()
 
 STICKER_PLUS_TAG_DESCRIPTION = (
     "<sticker_plus>情绪</sticker_plus> # 发送一个表情包消息用于情绪表达，"
@@ -116,6 +164,54 @@ class _PendingStickerSend:
         turn keeps its record.
         """
         return time.monotonic() - self.created_at < max_age
+
+
+async def _release_components(stealer, manager, db) -> None:
+    """Shut down one (stealer, manager, db) triple, best effort.
+
+    Used both by the synchronous teardown in ``_shutdown_components`` and by
+    the detached drainer, so the disposal sequence is defined exactly once.
+    Never raises: a failing component must not skip the release of the others.
+    """
+    if stealer is not None:
+        try:
+            await stealer.shutdown()
+        except Exception:
+            logger.warning("Error shutting down EmojiStealer", exc_info=True)
+    if manager is not None:
+        try:
+            await manager.shutdown()
+        except Exception:
+            logger.warning("Error shutting down EmojiManager", exc_info=True)
+    if db is not None:
+        try:
+            await db.dispose()
+        except Exception:
+            logger.warning("Error disposing emoji database", exc_info=True)
+
+
+async def _drain_detached_components(stealer, manager, db, sends) -> None:
+    """Wait for sends detached at a hot-reload boundary, then release their
+    components.
+
+    The hot-reload grace (HOT_RELOAD_SEND_GRACE) is deliberately shorter than
+    a slow pick; rather than disposing the manager/database while such a send
+    is still using them, the settings request detaches the components and
+    spawns this task. It gives the stragglers the full shutdown grace to
+    settle, then releases the components either way - a stuck send must not
+    pin resources forever.
+    """
+    try:
+        done, still_running = await asyncio.wait(set(sends), timeout=BG_SEND_SHUTDOWN_GRACE)
+        if still_running:
+            logger.warning(
+                "%d sticker_plus background send(s) still running %.0fs after a "
+                "hot reload; releasing their components anyway",
+                len(still_running), BG_SEND_SHUTDOWN_GRACE,
+            )
+    finally:
+        await _release_components(stealer, manager, db)
+
 
 class EmojiUpdateRequest(BaseModel):
     description: Optional[str] = None
@@ -199,10 +295,19 @@ class StickerPlusPlugin(BasePlugin):
         # Give in-flight background sends a bounded grace period instead of
         # cancelling them: a sticker already scheduled should still go out,
         # and its task keeps using the (snapshot) manager and the database
-        # below, so those must not be disposed underneath it. Tasks that
-        # exceed the grace period are left running (same design as above);
-        # their pick/send may then fail against torn-down resources, which
-        # the task's own exception handling records as a failed send.
+        # below, so those must not be disposed underneath it.
+        #
+        # Two paths diverge here:
+        # - Process shutdown (depth == 0): wait the full grace (also for
+        #   drainers still releasing older components), then tear down even
+        #   if sends remain - the process is exiting anyway.
+        # - Hot reload / config update (depth > 0): the triggering HTTP
+        #   request must not block for the full grace. If sends are still
+        #   running when the short grace expires, detach the components and
+        #   hand both to a background drainer (_drain_detached_components):
+        #   the sends finish against the resources they were scheduled with,
+        #   the request unblocks now, and the drainer releases the components
+        #   afterwards (bounded by BG_SEND_SHUTDOWN_GRACE).
         #
         # The teardown lives in a finally block on purpose: when this wait is
         # cancelled (host shutdown deadline, process-level cancellation), the
@@ -211,40 +316,66 @@ class StickerPlusPlugin(BasePlugin):
         # Cancellation still propagates after the teardown runs.
         try:
             if self._bg_sends:
-                # Hot reload / config update must not block the management page
-                # for the full shutdown grace: see HOT_RELOAD_SEND_GRACE.
-                grace = (
-                    HOT_RELOAD_SEND_GRACE if self._hot_reload_depth > 0
-                    else BG_SEND_SHUTDOWN_GRACE
-                )
-                done, still_running = await asyncio.wait(
-                    set(self._bg_sends), timeout=grace
-                )
+                hot_reload = self._hot_reload_depth > 0
+                grace = HOT_RELOAD_SEND_GRACE if hot_reload else BG_SEND_SHUTDOWN_GRACE
+                waiters = set(self._bg_sends)
+                if not hot_reload:
+                    # Sends detached by an earlier hot reload are owned by
+                    # their drainers; at process shutdown they deserve the
+                    # same bounded grace as our own sends. Drainers whose
+                    # loop is already gone can never settle - drop them.
+                    loop = asyncio.get_running_loop()
+                    for task in list(_active_drainers):
+                        if task.get_loop() is not loop:
+                            _active_drainers.discard(task)
+                    waiters |= set(_active_drainers)
+                done, still_running = await asyncio.wait(waiters, timeout=grace)
+                if still_running and hot_reload:
+                    self._defer_component_teardown(still_running & set(self._bg_sends))
+                    # Components were detached; the finally below is a no-op.
+                    return
                 if still_running:
                     logger.warning(
-                        "%d sticker_plus background send(s) still running after %.0fs grace; "
+                        "%d sticker_plus background task(s) still running after %.0fs grace; "
                         "continuing shutdown",
                         len(still_running), grace,
                     )
         finally:
-            if self._stealer is not None:
-                try:
-                    await self._stealer.shutdown()
-                except Exception:
-                    logger.warning("Error shutting down EmojiStealer", exc_info=True)
-                self._stealer = None
-            if self._manager is not None:
-                try:
-                    await self._manager.shutdown()
-                except Exception:
-                    logger.warning("Error shutting down EmojiManager", exc_info=True)
-                self._manager = None
-            if self._db is not None:
-                try:
-                    await self._db.dispose()
-                except Exception:
-                    logger.warning("Error disposing emoji database", exc_info=True)
-                self._db = None
+            await _release_components(
+                self._stealer, self._manager, self._db
+            )
+            self._stealer = None
+            self._manager = None
+            self._db = None
+
+    def _defer_component_teardown(self, stragglers: set[asyncio.Task]) -> None:
+        """Hand still-running sends and the components they use to a drainer.
+
+        Called on the hot-reload path when the short grace expires: instead of
+        disposing the manager/database underneath in-flight sends (which would
+        turn a healthy send into a bogus "internal error" failure), the
+        components are detached from this instance immediately and released by
+        a background task once the sends settle.
+        """
+        logger.warning(
+            "%d sticker_plus background send(s) still running after the %.0fs "
+            "hot-reload grace; deferring component teardown until they settle",
+            len(stragglers), HOT_RELOAD_SEND_GRACE,
+        )
+        drainer = asyncio.create_task(
+            _drain_detached_components(
+                self._stealer, self._manager, self._db, frozenset(stragglers)
+            )
+        )
+        # Ownership transfer: the drainer now holds the strong references, so
+        # these tasks must not be awaited/torn down again by this instance.
+        self._stealer = None
+        self._manager = None
+        self._db = None
+        for task in stragglers:
+            self._bg_sends.discard(task)
+        _active_drainers.add(drainer)
+        drainer.add_done_callback(_active_drainers.discard)
 
     def _resolve_vlm_client(self):
         """Tagging client: needs vision. Configured model wins, else the
@@ -610,21 +741,29 @@ class StickerPlusPlugin(BasePlugin):
 
         update_plugin_config re-initializes this plugin instance, so the
         response is built from locals only - do not touch self afterwards.
+
+        The module-level lock serializes config updates across instances:
+        the page-side settingsQueue only orders requests from one page, and
+        the host replaces this instance mid-update, so without a backend lock
+        two clients (or two tabs) could still interleave terminate/init.
         """
         plugin_mgr = getattr(self.ctx, "plugin_mgr", None)
         if plugin_mgr is None or not plugin_mgr.has_plugin(PLUGIN_ID):
             raise HTTPException(status_code=503, detail="Plugin manager not available")
-        # Hot reload, not a process shutdown: keep the in-flight-send grace short
-        self._hot_reload_depth += 1
-        try:
-            updated = await plugin_mgr.update_plugin_config(
-                PLUGIN_ID, {"steal_emoji": bool(request.steal_emoji)}
-            )
-        finally:
-            # Balanced even when the update raises or the host re-initializes
-            # this same instance in place: the depth must never outlive the
-            # request, or a later real shutdown would use the short grace.
-            self._hot_reload_depth -= 1
+        async with _settings_update_lock:
+            # Hot reload, not a process shutdown: keep the in-flight-send
+            # grace short
+            self._hot_reload_depth += 1
+            try:
+                updated = await plugin_mgr.update_plugin_config(
+                    PLUGIN_ID, {"steal_emoji": bool(request.steal_emoji)}
+                )
+            finally:
+                # Balanced even when the update raises or the host
+                # re-initializes this same instance in place: the depth must
+                # never outlive the request, or a later real shutdown would
+                # use the short grace.
+                self._hot_reload_depth -= 1
         return {"steal_emoji": bool(updated.get("steal_emoji", request.steal_emoji))}
 
     @register.api(method="PUT", path="/settings/steal-approval")
@@ -633,21 +772,24 @@ class StickerPlusPlugin(BasePlugin):
 
         Same persistence pattern as set_steal: update_plugin_config
         re-initializes this plugin instance, so build the response from
-        locals only - do not touch self afterwards.
+        locals only - do not touch self afterwards. Same module-level lock,
+        too: updates from any page/client/instance are strictly serialized.
         """
         plugin_mgr = getattr(self.ctx, "plugin_mgr", None)
         if plugin_mgr is None or not plugin_mgr.has_plugin(PLUGIN_ID):
             raise HTTPException(status_code=503, detail="Plugin manager not available")
-        # Hot reload, not a process shutdown: keep the in-flight-send grace short
-        self._hot_reload_depth += 1
-        try:
-            updated = await plugin_mgr.update_plugin_config(
-                PLUGIN_ID,
-                {"steal_require_approval": bool(request.steal_require_approval)},
-            )
-        finally:
-            # See set_steal: never let the depth outlive the update.
-            self._hot_reload_depth -= 1
+        async with _settings_update_lock:
+            # Hot reload, not a process shutdown: keep the in-flight-send
+            # grace short
+            self._hot_reload_depth += 1
+            try:
+                updated = await plugin_mgr.update_plugin_config(
+                    PLUGIN_ID,
+                    {"steal_require_approval": bool(request.steal_require_approval)},
+                )
+            finally:
+                # See set_steal: never let the depth outlive the update.
+                self._hot_reload_depth -= 1
         return {
             "steal_require_approval": bool(
                 updated.get("steal_require_approval", request.steal_require_approval)
