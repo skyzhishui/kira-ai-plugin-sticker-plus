@@ -758,3 +758,57 @@ async def test_shutdown_waits_for_drainers_without_own_sends(plugin, monkeypatch
     release.set()
     await asyncio.wait_for(shutdown, timeout=5)
     assert not main_mod._active_drainers, "drainer settled within the grace"
+
+
+@pytest.mark.asyncio
+async def test_new_send_during_shutdown_window_is_refused(plugin, monkeypatch):
+    """宽限窗口内的新调度必须被拒绝，不得漏到 drainer 的等待集合之外。
+
+    Regression (neko review): the host keeps dispatching tag callbacks to the
+    old instance until init_plugin re-registers them (after terminate), so a
+    turn can emit <sticker_plus> while the hot-reload grace wait yields
+    control. A send scheduled in that window used to miss both the waiter
+    snapshot and the drainer handoff, yet still run against the manager the
+    drainer was about to dispose.
+    """
+    monkeypatch.setattr(main_mod, "HOT_RELOAD_SEND_GRACE", 0.3)
+    monkeypatch.setattr(main_mod, "BG_SEND_SHUTDOWN_GRACE", 2.0)
+    pick_started = asyncio.Event()
+    release_pick = asyncio.Event()
+    shutdown_calls: list[float] = []
+    real_manager = plugin._manager
+
+    class _SlowPickManager:
+        def __getattr__(self, name):
+            return getattr(real_manager, name)
+
+        async def pick_emoji(self, emotion, recent_context):
+            pick_started.set()
+            await release_pick.wait()
+            return None
+
+        async def shutdown(self):
+            shutdown_calls.append(time.monotonic())
+            await real_manager.shutdown()
+
+    plugin._manager = _SlowPickManager()
+    plugin._schedule_sticker_send("开心", "", "chat-a")
+    assert await asyncio.wait_for(pick_started.wait(), timeout=2), "pick never started"
+
+    plugin._hot_reload_depth = 1
+    shutdown = asyncio.ensure_future(plugin._shutdown_components())
+    # Inside the grace window (before the defer fires): the host dispatches
+    # another turn's tag to this still-registered instance.
+    await asyncio.sleep(0.1)
+    plugin._schedule_sticker_send("开心", "", "chat-b")
+    assert "chat-b" not in plugin._pending_sends, (
+        "new send scheduled during the shutdown window must be refused"
+    )
+    assert len(plugin._bg_sends) == 1, "only the pre-window send may be in flight"
+
+    await asyncio.wait_for(shutdown, timeout=5)
+    drainers = set(main_mod._active_drainers)
+    assert drainers, "a drainer should own the detached components"
+    release_pick.set()
+    await asyncio.wait_for(asyncio.gather(*drainers), timeout=5)
+    assert len(shutdown_calls) == 1, "detached manager released exactly once"

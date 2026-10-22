@@ -246,6 +246,12 @@ class StickerPlusPlugin(BasePlugin):
         # overlap, and the first one finishing must not switch the grace back
         # to the shutdown value while another terminate is still pending.
         self._hot_reload_depth = 0
+        # True while _shutdown_components() is closing this incarnation (or
+        # until a successful initialize() reopens it): background sends
+        # scheduled during the close would miss both the waiter snapshot and
+        # the drainer handoff yet still run against components that are about
+        # to be released. See _shutdown_components / _schedule_sticker_send.
+        self._closing = False
 
     # ------------------------------------------------------------------
     # Lifecycle (must be re-entrant: config updates re-run initialize())
@@ -281,6 +287,10 @@ class StickerPlusPlugin(BasePlugin):
                 emoji_manager=self._manager,
                 max_size_mb=float(self.plugin_cfg.get("max_emoji_size_mb", 5.0)),
             )
+            # This incarnation is fully built: accept new background sends
+            # again (an in-place re-initialize kept _closing from the
+            # teardown at the top of this method).
+            self._closing = False
             logger.info("Sticker Plus initialized (capacity=%d)", self._manager.capacity)
         except Exception:
             logger.exception("Sticker Plus initialization failed (plugin degrades to no-op)")
@@ -290,6 +300,14 @@ class StickerPlusPlugin(BasePlugin):
         await self._shutdown_components()
 
     async def _shutdown_components(self) -> None:
+        # Refuse new background sends from this moment on: the host keeps
+        # dispatching tag callbacks to this instance until init_plugin
+        # re-registers them (which happens after terminate), so a turn can
+        # still emit <sticker_plus> while the grace wait below yields
+        # control. A send scheduled now would miss both the waiter snapshot
+        # and the drainer handoff, yet run against components that are about
+        # to be released. Cleared again by a successful initialize().
+        self._closing = True
         # Pending records die with this instance (hot reload boundary).
         self._pending_sends.clear()
         # Give in-flight background sends a bounded grace period instead of
@@ -335,7 +353,11 @@ class StickerPlusPlugin(BasePlugin):
                 grace = HOT_RELOAD_SEND_GRACE if hot_reload else BG_SEND_SHUTDOWN_GRACE
                 done, still_running = await asyncio.wait(waiters, timeout=grace)
                 if still_running and hot_reload:
-                    self._defer_component_teardown(still_running & set(self._bg_sends))
+                    # Re-snapshot instead of intersecting with the pre-wait
+                    # set: _closing refuses NEW schedules, but anything that
+                    # slipped in between the snapshot and here must still be
+                    # handed to the drainer (defense in depth).
+                    self._defer_component_teardown(set(self._bg_sends))
                     # Components were detached; the finally below is a no-op.
                     return
                 if still_running:
@@ -458,6 +480,13 @@ class StickerPlusPlugin(BasePlugin):
             return
         if self._manager is None:
             logger.warning("sticker_plus skipped: emoji library not initialized")
+            return
+        if self._closing:
+            # Shutdown or hot reload already started on this instance: the
+            # components this send would run against are being released.
+            logger.warning(
+                "sticker_plus skipped: instance shutdown already in progress"
+            )
             return
         # Snapshot the manager here, at schedule time, and hand it to the
         # detached task: a hot reload or shutdown may clear self._manager
