@@ -67,10 +67,25 @@ SEND_RECORD_WAIT_TIMEOUT = 10.0
 # event was stopped mid-send) are pruned after this many seconds.
 PENDING_RECORD_MAX_AGE = 60.0
 
+# Cross-session sweep TTL: a pending record older than this is considered dead
+# (its turn never reached the step-result hook) and is swept when any session
+# schedules a new sticker. Deliberately much longer than
+# PENDING_RECORD_MAX_AGE: a legitimately slow turn (LLM + tool calls easily
+# exceeds 60s) must not lose its send record just because another session
+# scheduled a sticker in the meantime.
+PENDING_SWEEP_MAX_AGE = 300.0
+
 # Grace period on shutdown: in-flight background sends are awaited (not
 # cancelled) for at most this long before components are torn down, so
 # stickers already scheduled still go out without blocking shutdown forever.
 BG_SEND_SHUTDOWN_GRACE = 15.0
+
+# Same grace for hot reload / config update (our own settings endpoints call
+# update_plugin_config -> init_plugin -> terminate on this instance). Kept
+# short on purpose: the HTTP request that triggered the update waits for it,
+# so a slow pick would otherwise block the management page for up to
+# BG_SEND_SHUTDOWN_GRACE per toggle (and the queue serializes two of them).
+HOT_RELOAD_SEND_GRACE = 2.0
 
 STICKER_PLUS_TAG_DESCRIPTION = (
     "<sticker_plus>情绪</sticker_plus> # 发送一个表情包消息用于情绪表达，"
@@ -93,9 +108,14 @@ class _PendingStickerSend:
     ok: bool = False
     detail: str = ""
 
-    def age_ok(self) -> bool:
-        """False once the record is stale (its turn never reached the hook)."""
-        return time.monotonic() - self.created_at < PENDING_RECORD_MAX_AGE
+    def age_ok(self, max_age: float = PENDING_RECORD_MAX_AGE) -> bool:
+        """False once the record is older than ``max_age`` seconds.
+
+        ``max_age`` defaults to PENDING_RECORD_MAX_AGE (same-sid pruning); the
+        cross-session sweep passes PENDING_SWEEP_MAX_AGE so a slow but live
+        turn keeps its record.
+        """
+        return time.monotonic() - self.created_at < max_age
 
 class EmojiUpdateRequest(BaseModel):
     description: Optional[str] = None
@@ -123,6 +143,10 @@ class StickerPlusPlugin(BasePlugin):
         self._pending_sends: dict[str, list[_PendingStickerSend]] = {}
         # Strong references so fire-and-forget send tasks are never GC'd.
         self._bg_sends: set[asyncio.Task] = set()
+        # Set by our settings endpoints before they trigger a config update:
+        # that path terminates this instance too, but it is a hot reload, not
+        # a process shutdown, so the grace wait must stay short.
+        self._hot_reload = False
 
     # ------------------------------------------------------------------
     # Lifecycle (must be re-entrant: config updates re-run initialize())
@@ -184,14 +208,20 @@ class StickerPlusPlugin(BasePlugin):
         # Cancellation still propagates after the teardown runs.
         try:
             if self._bg_sends:
+                # Hot reload / config update must not block the management page
+                # for the full shutdown grace: see HOT_RELOAD_SEND_GRACE.
+                grace = (
+                    HOT_RELOAD_SEND_GRACE if self._hot_reload
+                    else BG_SEND_SHUTDOWN_GRACE
+                )
                 done, still_running = await asyncio.wait(
-                    set(self._bg_sends), timeout=BG_SEND_SHUTDOWN_GRACE
+                    set(self._bg_sends), timeout=grace
                 )
                 if still_running:
                     logger.warning(
                         "%d sticker_plus background send(s) still running after %.0fs grace; "
                         "continuing shutdown",
-                        len(still_running), BG_SEND_SHUTDOWN_GRACE,
+                        len(still_running), grace,
                     )
         finally:
             if self._stealer is not None:
@@ -302,7 +332,9 @@ class StickerPlusPlugin(BasePlugin):
         # before its step-result hook never pops its bucket, so without a
         # sweep the dict keys would accumulate forever.
         for b_sid, records in list(self._pending_sends.items()):
-            records = [p for p in records if p.age_ok()]
+            # Long TTL here: another session's schedule must not drop a slow
+            # turn's record (see PENDING_SWEEP_MAX_AGE).
+            records = [p for p in records if p.age_ok(PENDING_SWEEP_MAX_AGE)]
             if records:
                 self._pending_sends[b_sid] = records
             else:
@@ -574,6 +606,8 @@ class StickerPlusPlugin(BasePlugin):
         plugin_mgr = getattr(self.ctx, "plugin_mgr", None)
         if plugin_mgr is None or not plugin_mgr.has_plugin(PLUGIN_ID):
             raise HTTPException(status_code=503, detail="Plugin manager not available")
+        # Hot reload, not a process shutdown: keep the in-flight-send grace short
+        self._hot_reload = True
         updated = await plugin_mgr.update_plugin_config(
             PLUGIN_ID, {"steal_emoji": bool(request.steal_emoji)}
         )
@@ -590,6 +624,8 @@ class StickerPlusPlugin(BasePlugin):
         plugin_mgr = getattr(self.ctx, "plugin_mgr", None)
         if plugin_mgr is None or not plugin_mgr.has_plugin(PLUGIN_ID):
             raise HTTPException(status_code=503, detail="Plugin manager not available")
+        # Hot reload, not a process shutdown: keep the in-flight-send grace short
+        self._hot_reload = True
         updated = await plugin_mgr.update_plugin_config(
             PLUGIN_ID,
             {"steal_require_approval": bool(request.steal_require_approval)},

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -427,3 +428,54 @@ async def test_send_task_uses_manager_snapshotted_at_schedule_time(plugin):
         assert "内部错误" not in step_result.raw_output
     finally:
         plugin._manager = saved_manager
+
+
+@pytest.mark.asyncio
+async def test_sweep_keeps_slow_turns_pending_record(plugin):
+    """跨会话清扫只清死记录：慢回合的记录不得被别的会话清掉。
+
+    Regression (neko review): the sweep used PENDING_RECORD_MAX_AGE (60s), so
+    a turn still running in session A (LLM + tool calls easily exceed 60s) lost
+    its pending record as soon as session B scheduled a sticker - the sticker
+    had gone out but the model never learned about it. The sweep now uses the
+    much longer PENDING_SWEEP_MAX_AGE.
+    """
+    slow = main_mod._PendingStickerSend()
+    slow.created_at = time.monotonic() - 70.0  # > 60s, < 300s
+    plugin._pending_sends["qq:gm:slow"] = [slow]
+    try:
+        plugin._schedule_sticker_send("开心", "", "qq:gm:fast")
+        assert "qq:gm:slow" in plugin._pending_sends, (
+            "a live slow turn's record must survive another session's sweep"
+        )
+        assert plugin._pending_sends["qq:gm:slow"] == [slow]
+    finally:
+        if plugin._bg_sends:
+            await asyncio.gather(*list(plugin._bg_sends), return_exceptions=True)
+        plugin._pending_sends.pop("qq:gm:fast", None)
+        plugin._pending_sends.pop("qq:gm:slow", None)
+
+
+@pytest.mark.asyncio
+async def test_hot_reload_shutdown_grace_is_short(plugin, monkeypatch):
+    """热重载（设置更新）走短宽限，不把 15s 停机等待带到管理页请求上。
+
+    Regression (neko review): update_plugin_config -> init_plugin -> terminate
+    hits _shutdown_components() too, so the full shutdown grace would block the
+    settings request (and the serialized queue behind it) for up to 15s.
+    """
+    monkeypatch.setattr(main_mod, "HOT_RELOAD_SEND_GRACE", 0.05)
+    monkeypatch.setattr(main_mod, "BG_SEND_SHUTDOWN_GRACE", 0.5)
+    ev = asyncio.Event()
+    hang = asyncio.ensure_future(ev.wait())
+    plugin._bg_sends.add(hang)
+    try:
+        plugin._hot_reload = True
+        start = time.monotonic()
+        await plugin._shutdown_components()
+        elapsed = time.monotonic() - start
+        assert elapsed < 0.3, f"hot reload waited {elapsed:.2f}s instead of the short grace"
+    finally:
+        plugin._bg_sends.discard(hang)
+        hang.cancel()
+        await asyncio.gather(hang, return_exceptions=True)
