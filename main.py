@@ -237,7 +237,7 @@ class StickerPlusPlugin(BasePlugin):
     @on.llm_request(priority=Priority.SYS_HIGH - 1)
     async def inject_sticker_plus_tag(self, event: KiraMessageBatchEvent, _, tag_set: TagSet):
         """Inject the <sticker_plus> tag when the adapter carries stickers."""
-        if "sticker" not in event.message_types:
+        if "sticker" not in event.supported_elements:
             return
         tag_set.register(self._build_sticker_plus_tag(event))
 

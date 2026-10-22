@@ -37,6 +37,7 @@
   .switch.on .track i { left: 20px; background: #fff; }
   .switch .sw-label { font-weight: 600; }
   .switch:focus-visible .track { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .switch.busy { opacity: .6; cursor: progress; }
 
   button { background: var(--accent); color: #06121f; border: none; border-radius: 6px;
            padding: 6px 14px; font: inherit; font-weight: 600; cursor: pointer; }
@@ -211,25 +212,65 @@ async function loadSettings() {
   }
 }
 
+// Switch toggles are guarded against re-entrancy, and all settings writes
+// are serialized.
+//
+// Why both:
+// - busySwitches: a repeated click on the SAME switch while its request is
+//   in flight is ignored (the backend has no idempotency for the toggle).
+// - settingsQueue: the backend re-initializes the plugin instance on every
+//   PUT /settings/* (update_plugin_config -> init_plugin -> terminate +
+//   init), and the host does not serialize that per plugin: the terminate()
+//   path pops the instance AFTER an await, so two concurrent updates can
+//   interleave and one of them pops the freshly installed instance (the
+//   plugin goes missing during re-initialization). A shared queue keeps the
+//   two switches strictly sequential.
+const busySwitches = new Set();
+let settingsQueue = Promise.resolve();
+
+function queueSettingsUpdate(task) {
+  const result = settingsQueue.then(() => task());
+  // Keep the chain alive even when a task rejects: the next queued task
+  // must still run.
+  settingsQueue = result.catch(() => {});
+  return result;
+}
+
 async function toggleSteal() {
   const sw = $("steal-switch");
+  if (busySwitches.has(sw.id)) return;
+  busySwitches.add(sw.id);
+  sw.classList.add("busy");
+  sw.setAttribute("aria-busy", "true");
   const target = sw.dataset.on !== "1";
   try {
-    const r = await call("PUT", "/settings/steal", { steal_emoji: target });
+    const r = await queueSettingsUpdate(() =>
+      call("PUT", "/settings/steal", { steal_emoji: target })
+    );
     sw.dataset.on = r.steal_emoji ? "1" : "0";
     sw.classList.toggle("on", !!r.steal_emoji);
     sw.setAttribute("aria-checked", r.steal_emoji ? "true" : "false");
     toast(r.steal_emoji ? "偷取表情已开启" : "偷取表情已关闭");
   } catch (e) {
     toast("切换失败: " + e.message, true);
+  } finally {
+    busySwitches.delete(sw.id);
+    sw.classList.remove("busy");
+    sw.removeAttribute("aria-busy");
   }
 }
 
 async function toggleStealApproval() {
   const sw = $("steal-approval-switch");
+  if (busySwitches.has(sw.id)) return;
+  busySwitches.add(sw.id);
+  sw.classList.add("busy");
+  sw.setAttribute("aria-busy", "true");
   const target = sw.dataset.on !== "1";
   try {
-    const r = await call("PUT", "/settings/steal-approval", { steal_require_approval: target });
+    const r = await queueSettingsUpdate(() =>
+      call("PUT", "/settings/steal-approval", { steal_require_approval: target })
+    );
     sw.dataset.on = r.steal_require_approval ? "1" : "0";
     sw.classList.toggle("on", !!r.steal_require_approval);
     sw.setAttribute("aria-checked", r.steal_require_approval ? "true" : "false");
@@ -238,6 +279,10 @@ async function toggleStealApproval() {
       : "偷取表情将直接入库启用");
   } catch (e) {
     toast("切换失败: " + e.message, true);
+  } finally {
+    busySwitches.delete(sw.id);
+    sw.classList.remove("busy");
+    sw.removeAttribute("aria-busy");
   }
 }
 
