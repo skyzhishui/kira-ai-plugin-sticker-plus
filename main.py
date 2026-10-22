@@ -176,34 +176,42 @@ class StickerPlusPlugin(BasePlugin):
         # exceed the grace period are left running (same design as above);
         # their pick/send may then fail against torn-down resources, which
         # the task's own exception handling records as a failed send.
-        if self._bg_sends:
-            done, still_running = await asyncio.wait(
-                set(self._bg_sends), timeout=BG_SEND_SHUTDOWN_GRACE
-            )
-            if still_running:
-                logger.warning(
-                    "%d sticker_plus background send(s) still running after %.0fs grace; "
-                    "continuing shutdown",
-                    len(still_running), BG_SEND_SHUTDOWN_GRACE,
+        #
+        # The teardown lives in a finally block on purpose: when this wait is
+        # cancelled (host shutdown deadline, process-level cancellation), the
+        # teardown used to be skipped entirely - leaking exactly the stealer /
+        # manager / database handles this grace period exists to protect.
+        # Cancellation still propagates after the teardown runs.
+        try:
+            if self._bg_sends:
+                done, still_running = await asyncio.wait(
+                    set(self._bg_sends), timeout=BG_SEND_SHUTDOWN_GRACE
                 )
-        if self._stealer is not None:
-            try:
-                await self._stealer.shutdown()
-            except Exception:
-                logger.warning("Error shutting down EmojiStealer", exc_info=True)
-            self._stealer = None
-        if self._manager is not None:
-            try:
-                await self._manager.shutdown()
-            except Exception:
-                logger.warning("Error shutting down EmojiManager", exc_info=True)
-            self._manager = None
-        if self._db is not None:
-            try:
-                await self._db.dispose()
-            except Exception:
-                logger.warning("Error disposing emoji database", exc_info=True)
-            self._db = None
+                if still_running:
+                    logger.warning(
+                        "%d sticker_plus background send(s) still running after %.0fs grace; "
+                        "continuing shutdown",
+                        len(still_running), BG_SEND_SHUTDOWN_GRACE,
+                    )
+        finally:
+            if self._stealer is not None:
+                try:
+                    await self._stealer.shutdown()
+                except Exception:
+                    logger.warning("Error shutting down EmojiStealer", exc_info=True)
+                self._stealer = None
+            if self._manager is not None:
+                try:
+                    await self._manager.shutdown()
+                except Exception:
+                    logger.warning("Error shutting down EmojiManager", exc_info=True)
+                self._manager = None
+            if self._db is not None:
+                try:
+                    await self._db.dispose()
+                except Exception:
+                    logger.warning("Error disposing emoji database", exc_info=True)
+                self._db = None
 
     def _resolve_vlm_client(self):
         """Tagging client: needs vision. Configured model wins, else the

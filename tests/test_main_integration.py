@@ -360,3 +360,42 @@ async def test_configured_models_route_via_get_llm_client(plugin):
     finally:
         plugin.plugin_cfg.pop("vlm_model", None)
         plugin.plugin_cfg.pop("selection_model", None)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cleanup_survives_cancelled_grace_wait(plugin):
+    """取消 15s 宽限等待不得跳过资源清理。
+
+    Regression (neko review): the grace wait sits in the middle of
+    ``_shutdown_components()``; when the coroutine is cancelled while waiting,
+    the teardown below it (stealer / manager / database) used to be skipped
+    entirely - leaking exactly the handles the grace period protects. The
+    teardown now lives in ``finally``, so it runs and the cancellation still
+    propagates.
+    """
+
+    class _FakeStealer:
+        def __init__(self):
+            self.closed = False
+
+        async def shutdown(self):
+            self.closed = True
+
+    stealer = _FakeStealer()
+    plugin._stealer = stealer
+    # A never-finishing background send keeps asyncio.wait inside the grace
+    # window long enough to be cancelled.
+    ev = asyncio.Event()
+    hang = asyncio.ensure_future(ev.wait())
+    plugin._bg_sends.add(hang)
+    shutdown_task = asyncio.ensure_future(plugin._shutdown_components())
+    await asyncio.sleep(0.05)
+    shutdown_task.cancel()
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await shutdown_task
+        assert stealer.closed, "cancelling the grace wait must not skip teardown"
+    finally:
+        plugin._bg_sends.discard(hang)
+        hang.cancel()
+        await asyncio.gather(hang, return_exceptions=True)
