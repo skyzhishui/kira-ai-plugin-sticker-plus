@@ -25,11 +25,11 @@ main_mod = importlib.import_module("kira-ai-plugin-sticker-plus.main")
 SID = "qq:dm:10001"
 
 
-def make_batch_event(text: str = "今天真开心呀，哈哈", sid: str = SID, message_types=None):
+def make_batch_event(text: str = "今天真开心呀，哈哈", sid: str = SID, supported_elements=None):
     """Minimal stand-in for a KiraMessageBatchEvent."""
     return SimpleNamespace(
         sid=sid,
-        message_types=message_types if message_types is not None else ["text", "sticker"],
+        supported_elements=supported_elements if supported_elements is not None else ["text", "sticker"],
         messages=[SimpleNamespace(message_str=text)],
     )
 
@@ -108,7 +108,7 @@ async def plugin(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_tag_injection_gated_by_message_types(plugin):
+async def test_tag_injection_gated_by_supported_elements(plugin):
     from core.tag import TagSet
 
     event = make_batch_event()
@@ -118,10 +118,10 @@ async def test_tag_injection_gated_by_message_types(plugin):
     tag = tag_set.get("sticker_plus")
     assert tag is not None and tag.name == "sticker_plus"
 
-    # Adapters without sticker message types must not get the tag.
+    # Adapters without sticker support must not get the tag.
     empty_tag_set = TagSet()
     await plugin.inject_sticker_plus_tag(
-        make_batch_event(message_types=["text"]), None, empty_tag_set
+        make_batch_event(supported_elements=["text"]), None, empty_tag_set
     )
     assert "sticker_plus" not in empty_tag_set
 
