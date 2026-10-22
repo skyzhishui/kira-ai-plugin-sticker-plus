@@ -291,6 +291,12 @@ class StickerPlusPlugin(BasePlugin):
         if self._manager is None:
             logger.warning("sticker_plus skipped: emoji library not initialized")
             return
+        # Snapshot the manager here, at schedule time, and hand it to the
+        # detached task: a hot reload or shutdown may clear self._manager
+        # between create_task() and the task's first step, and reading
+        # self._manager inside the task would then raise AttributeError on a
+        # None (recorded as a bogus "internal error" send failure).
+        manager = self._manager
         pending = _PendingStickerSend()
         # Prune every sid's bucket, not just this one: a turn interrupted
         # before its step-result hook never pops its bucket, so without a
@@ -305,24 +311,25 @@ class StickerPlusPlugin(BasePlugin):
         bucket.append(pending)
         self._pending_sends[sid] = bucket
         task = asyncio.create_task(
-            self._send_picked_sticker(emotion, recent_context, sid, pending)
+            self._send_picked_sticker(manager, emotion, recent_context, sid, pending)
         )
         self._bg_sends.add(task)
         task.add_done_callback(self._bg_sends.discard)
 
     async def _send_picked_sticker(
-        self, emotion: str, recent_context: str, sid: str, pending: _PendingStickerSend
+        self, manager, emotion: str, recent_context: str, sid: str, pending: _PendingStickerSend
     ) -> None:
         """Background task: pick via the selection LLM, send directly, record.
 
         Runs detached from the main model's turn; the step-result hook waits
         on ``pending.done`` to attach the outcome to the assistant message.
+
+        ``manager`` is snapshotted by the caller at schedule time instead of
+        being read from ``self`` here: a shutdown or hot reload may clear
+        ``self._manager`` while this detached task is still pending, and the
+        send must finish against the library instance it was scheduled with
+        (by design, in-flight sends are left alone on shutdown).
         """
-        # Snapshot the manager: a shutdown or hot reload may clear or replace
-        # self._manager while this detached task is still running; the send
-        # then finishes against the library instance it was scheduled with
-        # (by design, in-flight sends are left alone on shutdown).
-        manager = self._manager
         try:
             picked = await manager.pick_emoji(emotion, recent_context)
             if picked is None:
@@ -376,7 +383,7 @@ class StickerPlusPlugin(BasePlugin):
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 logger.warning(
-                    "sticker_plus send not settled within %.0fs; record skipped",
+                    "sticker_plus send not settled within the %.0fs batch budget; record skipped",
                     SEND_RECORD_WAIT_TIMEOUT,
                 )
                 continue
@@ -386,7 +393,7 @@ class StickerPlusPlugin(BasePlugin):
                 await asyncio.wait_for(pending.done.wait(), timeout=remaining)
             except asyncio.TimeoutError:
                 logger.warning(
-                    "sticker_plus send not settled within %.0fs; record skipped",
+                    "sticker_plus send not settled within the %.0fs batch budget; record skipped",
                     SEND_RECORD_WAIT_TIMEOUT,
                 )
                 continue

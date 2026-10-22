@@ -399,3 +399,31 @@ async def test_shutdown_cleanup_survives_cancelled_grace_wait(plugin):
         plugin._bg_sends.discard(hang)
         hang.cancel()
         await asyncio.gather(hang, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_send_task_uses_manager_snapshotted_at_schedule_time(plugin):
+    """调度时快照 manager：任务首次执行前清空 self._manager 不得影响该次发送。
+
+    Regression (neko review): the snapshot used to be taken inside the task
+    coroutine, i.e. at its first step. A hot reload / shutdown running between
+    ``create_task()`` and that first step clears ``self._manager``, so the task
+    then read None and raised ``AttributeError`` (recorded as a bogus
+    "internal error" send failure) instead of using the library instance it
+    was scheduled with.
+    """
+    event = make_batch_event()
+    tag = plugin._build_sticker_plus_tag(event)
+    saved_manager = plugin._manager
+    try:
+        await tag.handle("开心")  # creates the task; it has not run yet
+        plugin._manager = None  # the race window: reload/shutdown in between
+        if plugin._bg_sends:
+            await asyncio.gather(*list(plugin._bg_sends), return_exceptions=True)
+        step_result = make_step_result("<msg><sticker_plus>开心</sticker_plus></msg>")
+        await plugin.attach_sticker_send_record(event, step_result)
+        # Empty library -> the scheduled manager reports "no suitable emoji".
+        assert "表情包库中没有合适的表情" in step_result.raw_output
+        assert "内部错误" not in step_result.raw_output
+    finally:
+        plugin._manager = saved_manager
