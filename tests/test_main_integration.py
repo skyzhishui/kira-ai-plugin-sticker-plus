@@ -128,6 +128,7 @@ async def _clean_module_drainers():
     if live:
         await asyncio.gather(*live, return_exceptions=True)
     main_mod._active_drainers.clear()
+    main_mod._hot_reload_depth = 0
 
 
 @pytest.mark.asyncio
@@ -492,7 +493,7 @@ async def test_hot_reload_shutdown_grace_is_short(plugin, monkeypatch):
     hang = asyncio.ensure_future(ev.wait())
     plugin._bg_sends.add(hang)
     try:
-        plugin._hot_reload_depth = 1
+        main_mod._hot_reload_depth = 1
         start = time.monotonic()
         await plugin._shutdown_components()
         elapsed = time.monotonic() - start
@@ -524,14 +525,18 @@ async def test_hot_reload_flag_does_not_outlive_the_update(plugin):
     try:
         with pytest.raises(RuntimeError):
             await plugin.set_steal(main_mod.StealSettingRequest(steal_emoji=True))
-        assert plugin._hot_reload_depth == 0, "depth leaked after a failed update"
+        assert main_mod._hot_reload_depth == 0, "depth leaked after a failed update"
 
-        # An in-place re-initialize inside an update keeps the depth > 0, and
-        # the balanced decrement afterwards must leave no residue.
-        plugin._hot_reload_depth = 1
+        # The depth is module-level now: initialize() must NOT reset it (the
+        # endpoint's finally owns the balance), so a teardown inside an
+        # update window keeps the short grace for its whole duration.
+        main_mod._hot_reload_depth = 1
         await plugin.initialize()
-        plugin._hot_reload_depth -= 1
-        assert plugin._hot_reload_depth == 0
+        assert main_mod._hot_reload_depth == 1, (
+            "initialize() must not reset the settings-update depth"
+        )
+        main_mod._hot_reload_depth -= 1
+        assert main_mod._hot_reload_depth == 0
     finally:
         del plugin.ctx.plugin_mgr
 
@@ -576,7 +581,7 @@ async def test_concurrent_settings_updates_are_serialized(plugin):
         )
         gate.set()
         await asyncio.gather(t1, t2)
-        assert plugin._hot_reload_depth == 0
+        assert main_mod._hot_reload_depth == 0
         assert events == [
             ("enter", main_mod.PLUGIN_ID),
             ("exit", main_mod.PLUGIN_ID),
@@ -683,7 +688,7 @@ async def test_hot_reload_defers_component_teardown_until_sends_settle(
     plugin._schedule_sticker_send("开心", "让我看看", "chat-1")
     assert await asyncio.wait_for(pick_started.wait(), timeout=2), "pick never started"
 
-    plugin._hot_reload_depth = 1
+    main_mod._hot_reload_depth = 1
     start = time.monotonic()
     await plugin._shutdown_components()
     elapsed = time.monotonic() - start
@@ -795,7 +800,7 @@ async def test_new_send_during_shutdown_window_is_refused(plugin, monkeypatch):
     plugin._schedule_sticker_send("开心", "", "chat-a")
     assert await asyncio.wait_for(pick_started.wait(), timeout=2), "pick never started"
 
-    plugin._hot_reload_depth = 1
+    main_mod._hot_reload_depth = 1
     shutdown = asyncio.ensure_future(plugin._shutdown_components())
     # Inside the grace window (before the defer fires): the host dispatches
     # another turn's tag to this still-registered instance.
@@ -812,3 +817,99 @@ async def test_new_send_during_shutdown_window_is_refused(plugin, monkeypatch):
     release_pick.set()
     await asyncio.wait_for(asyncio.gather(*drainers), timeout=5)
     assert len(shutdown_calls) == 1, "detached manager released exactly once"
+
+@pytest.mark.asyncio
+async def test_initialize_teardown_does_not_wait_for_drainers(plugin, monkeypatch):
+    """initialize() 内部 teardown 不得等待 detached drainer。
+
+    Regression (neko review): the fresh instance built inside a settings
+    update has depth 0, so its initialize() -> _shutdown_components() used
+    to join _active_drainers (left by the OLD instance's defer) with the
+    full BG_SEND_SHUTDOWN_GRACE - blocking the settings request for up to
+    15s, exactly the stall the drainer design was meant to remove.
+    """
+    monkeypatch.setattr(main_mod, "BG_SEND_SHUTDOWN_GRACE", 3.0)
+    release = asyncio.Event()
+    hang = asyncio.ensure_future(release.wait())
+    plugin._defer_component_teardown({hang})
+    assert main_mod._active_drainers
+
+    start = time.monotonic()
+    await asyncio.wait_for(plugin.initialize(), timeout=5)
+    elapsed = time.monotonic() - start
+    assert elapsed < 1.5, (
+        f"initialize blocked {elapsed:.2f}s behind a detached drainer"
+    )
+    assert main_mod._active_drainers, "drainer still running independently"
+
+    release.set()
+    await asyncio.wait_for(
+        asyncio.gather(*list(main_mod._active_drainers)), timeout=5
+    )
+    assert not main_mod._active_drainers
+
+
+@pytest.mark.asyncio
+async def test_depth_is_module_level_across_instances(plugin, monkeypatch):
+    """depth 必须模块级：旧实例上的 handler 计数，terminate 却落在当前实例。
+
+    Regression (neko review): a second request dispatched before the routes
+    rebind runs on the STALE instance's handler; a per-instance depth was
+    raised there, while update_plugin_config terminates the CURRENT fresh
+    instance - whose depth was 0, so its teardown used the 15s process
+    grace and force-released components under the parked send instead of
+    the short hot-reload grace + drainer handoff.
+    """
+    monkeypatch.setattr(main_mod, "HOT_RELOAD_SEND_GRACE", 0.05)
+    monkeypatch.setattr(main_mod, "BG_SEND_SHUTDOWN_GRACE", 3.0)
+
+    # The "current" instance the host will terminate: fresh, with a slow
+    # in-flight send.
+    other = main_mod.StickerPlusPlugin(plugin.ctx, dict(plugin.plugin_cfg))
+    await other.initialize()
+    pick_started = asyncio.Event()
+    release_pick = asyncio.Event()
+    real_manager = other._manager
+
+    class _SlowPickManager:
+        def __getattr__(self, name):
+            return getattr(real_manager, name)
+
+        async def pick_emoji(self, emotion, recent_context):
+            pick_started.set()
+            await release_pick.wait()
+            return None
+
+    other._manager = _SlowPickManager()
+    other._schedule_sticker_send("开心", "", "chat-current")
+    assert await asyncio.wait_for(pick_started.wait(), timeout=2)
+
+    # The host's update_plugin_config, simulated: it terminates whatever
+    # instance is CURRENT (other), no matter which handler raised the depth.
+    class _TerminatingMgr:
+        def has_plugin(self, plugin_id):
+            return True
+
+        async def update_plugin_config(self, plugin_id, cfg):
+            await other._shutdown_components()
+            return cfg
+
+    plugin.ctx.plugin_mgr = _TerminatingMgr()
+    try:
+        start = time.monotonic()
+        await plugin.set_steal(main_mod.StealSettingRequest(steal_emoji=True))
+        elapsed = time.monotonic() - start
+        # Stale-instance handler raised the (module) depth; the teardown of
+        # the current instance must still take the short grace and defer.
+        assert elapsed < 1.5, (
+            f"update blocked {elapsed:.2f}s - depth not seen across instances"
+        )
+        assert other._manager is None, "components should be deferred, not held"
+        assert main_mod._active_drainers, "straggler should be handed to a drainer"
+        assert main_mod._hot_reload_depth == 0, "depth balanced by the endpoint"
+    finally:
+        del plugin.ctx.plugin_mgr
+        release_pick.set()
+        drainers = set(main_mod._active_drainers)
+        if drainers:
+            await asyncio.gather(*drainers, return_exceptions=True)

@@ -135,6 +135,19 @@ _settings_update_lock = _LoopLocalLock()
 # these too, so detached sends still get their bounded grace.
 _active_drainers: set[asyncio.Task] = set()
 
+# Depth of in-flight settings updates (our own PUT /settings/* handlers),
+# counted across ALL instances of this plugin: the host replaces the instance
+# inside update_plugin_config, and a second request dispatched before the
+# routes rebind still runs on the stale instance - its handler would raise a
+# per-instance counter on an object the host no longer terminates, while the
+# actually-terminated fresh instance would observe 0 and fall back to the
+# long process-shutdown grace (blocking that request ~15s and force-releasing
+# components under in-flight sends). Module-level, like the lock, so any
+# teardown running inside an update window sees the hot-reload grace.
+# A counter, not a bool: overlapping windows from stale-routed requests must
+# not cancel each other's short grace.
+_hot_reload_depth = 0
+
 STICKER_PLUS_TAG_DESCRIPTION = (
     "<sticker_plus>情绪</sticker_plus> # 发送一个表情包消息用于情绪表达，"
     "在闲聊、调侃、被调侃等场景推荐使用。填入当前语境最贴切的情绪关键词，"
@@ -239,13 +252,9 @@ class StickerPlusPlugin(BasePlugin):
         self._pending_sends: dict[str, list[_PendingStickerSend]] = {}
         # Strong references so fire-and-forget send tasks are never GC'd.
         self._bg_sends: set[asyncio.Task] = set()
-        # Depth counter of in-flight settings updates (our own PUT /settings/*
-        # handlers). That path terminates this instance too, but it is a hot
-        # reload, not a process shutdown, so the grace wait must stay short.
-        # A counter, not a bool: concurrent updates (multi-tab, other clients)
-        # overlap, and the first one finishing must not switch the grace back
-        # to the shutdown value while another terminate is still pending.
-        self._hot_reload_depth = 0
+        # (Settings-update depth lives at module level: see _hot_reload_depth
+        # there. The instance replacement inside update_plugin_config makes a
+        # per-instance counter observe the wrong teardown.)
         # True while _shutdown_components() is closing this incarnation (or
         # until a successful initialize() reopens it): background sends
         # scheduled during the close would miss both the waiter snapshot and
@@ -258,8 +267,13 @@ class StickerPlusPlugin(BasePlugin):
     # ------------------------------------------------------------------
 
     async def initialize(self):
-        # Tear down any previous incarnation first (hot reload safety).
-        await self._shutdown_components()
+        # Tear down any previous incarnation first (hot reload safety). The
+        # internal teardown must NOT wait for detached drainers: they release
+        # their own (previous) components on their own schedule, and blocking
+        # initialization - and the settings request behind it - for up to
+        # BG_SEND_SHUTDOWN_GRACE would reintroduce the very stall the drainer
+        # exists to prevent.
+        await self._shutdown_components(wait_detached_drainers=False)
 
         try:
             data_dir = Path(self.ctx.get_plugin_data_dir())
@@ -294,12 +308,16 @@ class StickerPlusPlugin(BasePlugin):
             logger.info("Sticker Plus initialized (capacity=%d)", self._manager.capacity)
         except Exception:
             logger.exception("Sticker Plus initialization failed (plugin degrades to no-op)")
-            await self._shutdown_components()
+            # Cleanup of THIS instance's half-built components; detached
+            # drainers are unrelated and release themselves.
+            await self._shutdown_components(wait_detached_drainers=False)
 
     async def terminate(self):
         await self._shutdown_components()
 
-    async def _shutdown_components(self) -> None:
+    async def _shutdown_components(
+        self, wait_detached_drainers: bool = True
+    ) -> None:
         # Refuse new background sends from this moment on: the host keeps
         # dispatching tag callbacks to this instance until init_plugin
         # re-registers them (which happens after terminate), so a turn can
@@ -339,15 +357,17 @@ class StickerPlusPlugin(BasePlugin):
             for task in list(_active_drainers):
                 if task.get_loop() is not loop:
                     _active_drainers.discard(task)
-            hot_reload = self._hot_reload_depth > 0
+            hot_reload = _hot_reload_depth > 0
             waiters = set(self._bg_sends)
-            if not hot_reload:
-                # Process shutdown: sends detached by an earlier hot reload
-                # are owned by their drainers; they deserve the same bounded
-                # grace as our own sends, even when this instance has no
-                # in-flight send left of its own. (Hot reload is the
-                # opposite: unblocking fast is that path's whole point, so
-                # drainers are deliberately not waited for there.)
+            if not hot_reload and wait_detached_drainers:
+                # Process shutdown (default): sends detached by an earlier
+                # hot reload are owned by their drainers; they deserve the
+                # same bounded grace as our own sends, even when this
+                # instance has no in-flight send left of its own. Not waited
+                # for on hot reload (unblocking fast is that path's whole
+                # point) nor inside initialize()'s internal teardown (the
+                # drainers release themselves; blocking re-initialization
+                # would stall the settings request behind it).
                 waiters |= set(_active_drainers)
             if waiters:
                 grace = HOT_RELOAD_SEND_GRACE if hot_reload else BG_SEND_SHUTDOWN_GRACE
@@ -789,20 +809,22 @@ class StickerPlusPlugin(BasePlugin):
         plugin_mgr = getattr(self.ctx, "plugin_mgr", None)
         if plugin_mgr is None or not plugin_mgr.has_plugin(PLUGIN_ID):
             raise HTTPException(status_code=503, detail="Plugin manager not available")
+        global _hot_reload_depth
         async with _settings_update_lock:
             # Hot reload, not a process shutdown: keep the in-flight-send
-            # grace short
-            self._hot_reload_depth += 1
+            # grace short. The counter is module-level: this handler may run
+            # on a stale instance while the host terminates the current one.
+            _hot_reload_depth += 1
             try:
                 updated = await plugin_mgr.update_plugin_config(
                     PLUGIN_ID, {"steal_emoji": bool(request.steal_emoji)}
                 )
             finally:
                 # Balanced even when the update raises or the host
-                # re-initializes this same instance in place: the depth must
-                # never outlive the request, or a later real shutdown would
-                # use the short grace.
-                self._hot_reload_depth -= 1
+                # re-initializes an instance in place: the depth must never
+                # outlive the request, or a later real shutdown would use
+                # the short grace.
+                _hot_reload_depth -= 1
         return {"steal_emoji": bool(updated.get("steal_emoji", request.steal_emoji))}
 
     @register.api(method="PUT", path="/settings/steal-approval")
@@ -817,18 +839,19 @@ class StickerPlusPlugin(BasePlugin):
         plugin_mgr = getattr(self.ctx, "plugin_mgr", None)
         if plugin_mgr is None or not plugin_mgr.has_plugin(PLUGIN_ID):
             raise HTTPException(status_code=503, detail="Plugin manager not available")
+        global _hot_reload_depth
         async with _settings_update_lock:
-            # Hot reload, not a process shutdown: keep the in-flight-send
-            # grace short
-            self._hot_reload_depth += 1
+            # See set_steal: module-level depth, short grace, balanced in
+            # finally.
+            _hot_reload_depth += 1
             try:
                 updated = await plugin_mgr.update_plugin_config(
                     PLUGIN_ID,
                     {"steal_require_approval": bool(request.steal_require_approval)},
                 )
             finally:
-                # See set_steal: never let the depth outlive the update.
-                self._hot_reload_depth -= 1
+                # Never let the depth outlive the update.
+                _hot_reload_depth -= 1
         return {
             "steal_require_approval": bool(
                 updated.get("steal_require_approval", request.steal_require_approval)
