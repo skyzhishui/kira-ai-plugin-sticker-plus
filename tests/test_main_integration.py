@@ -704,3 +704,57 @@ async def test_hot_reload_defers_component_teardown_until_sends_settle(
     # The send was recorded as a graceful "no candidate", not an error.
     bucket = plugin._pending_sends.get("chat-1", [])
     assert not bucket, "pending records die at the hot-reload boundary"
+
+
+@pytest.mark.asyncio
+async def test_same_sid_sweep_keeps_short_ttl(plugin):
+    """同 sid 清扫保持短 TTL：被打断回合的旧记录不得混进新回合的 reminder。
+
+    Regression (neko review): the cross-session sweep used
+    PENDING_SWEEP_MAX_AGE (300s) for the CURRENT sid too, so a record left
+    by a turn interrupted mid-send survived for minutes and was then popped
+    wholesale by the next turn's hook - the model read a stale sticker's
+    outcome as if the new message had sent it.
+    """
+    stale = main_mod._PendingStickerSend()
+    stale.created_at = time.monotonic() - 70.0  # > 60s, < 300s
+    plugin._pending_sends["qq:gm:x"] = [stale]
+    try:
+        plugin._schedule_sticker_send("开心", "", "qq:gm:x")
+        bucket = plugin._pending_sends["qq:gm:x"]
+        assert stale not in bucket, (
+            "a stale same-session record must be pruned by the short TTL"
+        )
+        assert len(bucket) == 1, "only the freshly scheduled record remains"
+    finally:
+        if plugin._bg_sends:
+            await asyncio.gather(*list(plugin._bg_sends), return_exceptions=True)
+        plugin._pending_sends.pop("qq:gm:x", None)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_waits_for_drainers_without_own_sends(plugin, monkeypatch):
+    """停机时本实例没有在途发送，也必须等在途 drainer。
+
+    Regression (neko review): the drainer wait was nested inside
+    ``if self._bg_sends:`` - with no own sends, shutdown skipped it and the
+    drainer-held manager/db were released only via loop-close cancellation,
+    where the release awaits are not guaranteed to run at all.
+    """
+    monkeypatch.setattr(main_mod, "BG_SEND_SHUTDOWN_GRACE", 2.0)
+    release = asyncio.Event()
+    hang = asyncio.ensure_future(release.wait())
+
+    # Hand the plugin's real components to a drainer parked on `hang`.
+    plugin._defer_component_teardown({hang})
+    assert plugin._manager is None and plugin._db is None
+    assert main_mod._active_drainers, "drainer must own the detached components"
+
+    # depth == 0 -> process shutdown path; no own bg sends at all.
+    assert not plugin._bg_sends
+    shutdown = asyncio.ensure_future(plugin._shutdown_components())
+    await asyncio.sleep(0.1)
+    assert not shutdown.done(), "shutdown skipped waiting for the drainer"
+    release.set()
+    await asyncio.wait_for(shutdown, timeout=5)
+    assert not main_mod._active_drainers, "drainer settled within the grace"

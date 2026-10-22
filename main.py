@@ -315,20 +315,24 @@ class StickerPlusPlugin(BasePlugin):
         # manager / database handles this grace period exists to protect.
         # Cancellation still propagates after the teardown runs.
         try:
-            if self._bg_sends:
-                hot_reload = self._hot_reload_depth > 0
+            # Drainers whose loop is already gone can never settle - drop
+            # them before building the waiter set.
+            loop = asyncio.get_running_loop()
+            for task in list(_active_drainers):
+                if task.get_loop() is not loop:
+                    _active_drainers.discard(task)
+            hot_reload = self._hot_reload_depth > 0
+            waiters = set(self._bg_sends)
+            if not hot_reload:
+                # Process shutdown: sends detached by an earlier hot reload
+                # are owned by their drainers; they deserve the same bounded
+                # grace as our own sends, even when this instance has no
+                # in-flight send left of its own. (Hot reload is the
+                # opposite: unblocking fast is that path's whole point, so
+                # drainers are deliberately not waited for there.)
+                waiters |= set(_active_drainers)
+            if waiters:
                 grace = HOT_RELOAD_SEND_GRACE if hot_reload else BG_SEND_SHUTDOWN_GRACE
-                waiters = set(self._bg_sends)
-                if not hot_reload:
-                    # Sends detached by an earlier hot reload are owned by
-                    # their drainers; at process shutdown they deserve the
-                    # same bounded grace as our own sends. Drainers whose
-                    # loop is already gone can never settle - drop them.
-                    loop = asyncio.get_running_loop()
-                    for task in list(_active_drainers):
-                        if task.get_loop() is not loop:
-                            _active_drainers.discard(task)
-                    waiters |= set(_active_drainers)
                 done, still_running = await asyncio.wait(waiters, timeout=grace)
                 if still_running and hot_reload:
                     self._defer_component_teardown(still_running & set(self._bg_sends))
@@ -466,9 +470,15 @@ class StickerPlusPlugin(BasePlugin):
         # before its step-result hook never pops its bucket, so without a
         # sweep the dict keys would accumulate forever.
         for b_sid, records in list(self._pending_sends.items()):
-            # Long TTL here: another session's schedule must not drop a slow
-            # turn's record (see PENDING_SWEEP_MAX_AGE).
-            records = [p for p in records if p.age_ok(PENDING_SWEEP_MAX_AGE)]
+            # Long TTL for OTHER sessions: a slow turn there (LLM + tool
+            # calls) must survive this schedule (see PENDING_SWEEP_MAX_AGE).
+            # The CURRENT sid keeps the short TTL: a record still sitting
+            # here when the same session schedules again can only come from
+            # a turn interrupted mid-send, and such a stale record must not
+            # ride along into the next turn's reminder as if that message
+            # had sent the sticker.
+            ttl = PENDING_SWEEP_MAX_AGE if b_sid != sid else PENDING_RECORD_MAX_AGE
+            records = [p for p in records if p.age_ok(ttl)]
             if records:
                 self._pending_sends[b_sid] = records
             else:
