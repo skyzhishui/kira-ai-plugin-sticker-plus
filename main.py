@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -107,26 +108,40 @@ HOT_RELOAD_SEND_GRACE = 2.0
 #
 # The holder rebinding on loop change exists because asyncio.Lock caches the
 # loop of its first acquire and raises on any other. The host runs one loop
-# at a time (a new loop only appears after the old one is gone), so no holder
-# of the previous lock can still be alive when the lock is rebound - the
-# serialization is never weakened in practice.
+# at a time, so rebinding is the right granularity. Cross-loop liveness is
+# NOT assumed away: each holder releases exactly the lock IT acquired (kept
+# in a local by hold()), so even if a rebind raced a still-alive holder from
+# the previous loop, that holder could neither release the new holder's
+# lock nor raise "Lock is not acquired" - at worst two holders on two
+# different, non-concurrent loops would hold two different lock objects,
+# which the one-loop-at-a-time lifecycle makes impossible anyway.
 class _LoopLocalLock:
-    """An asyncio.Lock recreated when used from a different loop."""
+    """An asyncio.Lock recreated when used from a different loop.
+
+    Use as ``async with lock_obj.hold():`` - hold() is a context manager on
+    purpose: the acquired lock object must live in a local so the release
+    always targets it, never whatever the holder field points to by the
+    time the block exits.
+    """
 
     def __init__(self) -> None:
         self._lock: Optional[asyncio.Lock] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
-    async def __aenter__(self) -> None:
+    @asynccontextmanager
+    async def hold(self):
         loop = asyncio.get_running_loop()
         if self._lock is None or self._loop is not loop:
             self._lock = asyncio.Lock()
             self._loop = loop
-        await self._lock.acquire()
-
-    async def __aexit__(self, *exc) -> None:
-        if self._lock is not None:
-            self._lock.release()
+        lock = self._lock
+        await lock.acquire()
+        try:
+            yield
+        finally:
+            # Release exactly the lock this acquisition took - even if the
+            # holder field was rebound to a fresh lock in the meantime.
+            lock.release()
 
 
 _settings_update_lock = _LoopLocalLock()
@@ -846,7 +861,7 @@ class StickerPlusPlugin(BasePlugin):
         # stale/fresh instance swap. Grace for the teardown is not set here:
         # every non-process-exit terminate takes the short grace + drainer
         # path (see _process_shutting_down).
-        async with _settings_update_lock:
+        async with _settings_update_lock.hold():
             updated = await plugin_mgr.update_plugin_config(
                 PLUGIN_ID, {"steal_emoji": bool(request.steal_emoji)}
             )
@@ -866,7 +881,7 @@ class StickerPlusPlugin(BasePlugin):
             raise HTTPException(status_code=503, detail="Plugin manager not available")
         # See set_steal: module-level lock only; the teardown grace needs no
         # per-request state (see _process_shutting_down).
-        async with _settings_update_lock:
+        async with _settings_update_lock.hold():
             updated = await plugin_mgr.update_plugin_config(
                 PLUGIN_ID,
                 {"steal_require_approval": bool(request.steal_require_approval)},

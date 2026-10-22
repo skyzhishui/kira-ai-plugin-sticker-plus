@@ -513,12 +513,17 @@ $("steal-approval-switch").addEventListener("click", toggleStealApproval);
 // Keyboard support for the switch controls (role="switch" widgets)
 for (const [id, toggle] of [["steal-switch", toggleSteal], ["steal-approval-switch", toggleStealApproval]]) {
   $(id).addEventListener("keydown", e => {
+    if (e.key !== "Enter" && e.key !== " ") return;
+    // Swallow Enter/Space first: a role="switch" div has no native key
+    // handling, so an un-prevented repeat falls through to the browser's
+    // scroll-on-Space behavior and the page jumps while the key is held.
+    e.preventDefault();
     // Auto-repeat must not re-toggle: holding Enter/Space keeps firing
     // keydown, and the in-flight guard only covers the request window - once
     // the response lands the held key would toggle again and re-trigger the
     // plugin re-initialization on the backend.
     if (e.repeat) return;
-    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(); }
+    toggle();
   });
 }
 

@@ -972,3 +972,35 @@ async def test_settled_record_survives_budget_exhaustion(plugin, monkeypatch):
         "<system_reminder>已随本条消息发送表情包：编号1"
     ) == 1, "settled record must be read even after the budget is exhausted"
     assert SID not in plugin._pending_sends
+
+@pytest.mark.asyncio
+async def test_loop_local_lock_releases_only_its_own_lock():
+    """跨 loop 重绑定时，持有者只能释放自己 acquire 的那把锁。
+
+    Regression (neko review): __aexit__ used to release whatever the holder
+    field pointed to at exit time. A rebind racing a still-alive holder from
+    the previous loop would let that holder release the NEW holder's lock;
+    the new holder's own exit then raised "Lock is not acquired" straight
+    into the settings endpoints. hold() keeps the acquired lock in a local
+    and releases exactly that one.
+    """
+    lk = main_mod._LoopLocalLock()
+    cm = lk.hold()
+    await cm.__aenter__()
+    old_lock = lk._lock
+    assert old_lock is not None and old_lock.locked()
+
+    # Simulate the holder field being rebound while the first holder is
+    # still inside its critical section (a request on another loop).
+    lk._lock = asyncio.Lock()
+    lk._loop = None
+    new_lock = lk._lock
+    await new_lock.acquire()  # the "new holder" now holds the new lock
+
+    # First holder exits: it must release ITS lock, not the new one.
+    await cm.__aexit__(None, None, None)
+    assert not old_lock.locked(), "holder released its own lock"
+    assert new_lock.locked(), "holder must not release the rebound lock"
+
+    # And the new holder exits cleanly, without RuntimeError.
+    new_lock.release()
