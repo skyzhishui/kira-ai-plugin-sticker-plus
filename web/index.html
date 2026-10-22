@@ -212,12 +212,29 @@ async function loadSettings() {
   }
 }
 
-// Switch toggles are guarded against re-entrancy: the backend PUT
-// /settings/* re-initializes the plugin instance, so two concurrent
-// requests would race each other (and the UI state would flicker between
-// the two responses). The guard is keyed by switch id, so the two
-// switches stay independent.
+// Switch toggles are guarded against re-entrancy, and all settings writes
+// are serialized.
+//
+// Why both:
+// - busySwitches: a repeated click on the SAME switch while its request is
+//   in flight is ignored (the backend has no idempotency for the toggle).
+// - settingsQueue: the backend re-initializes the plugin instance on every
+//   PUT /settings/* (update_plugin_config -> init_plugin -> terminate +
+//   init), and the host does not serialize that per plugin: the terminate()
+//   path pops the instance AFTER an await, so two concurrent updates can
+//   interleave and one of them pops the freshly installed instance (the
+//   plugin goes missing during re-initialization). A shared queue keeps the
+//   two switches strictly sequential.
 const busySwitches = new Set();
+let settingsQueue = Promise.resolve();
+
+function queueSettingsUpdate(task) {
+  const result = settingsQueue.then(() => task());
+  // Keep the chain alive even when a task rejects: the next queued task
+  // must still run.
+  settingsQueue = result.catch(() => {});
+  return result;
+}
 
 async function toggleSteal() {
   const sw = $("steal-switch");
@@ -227,7 +244,9 @@ async function toggleSteal() {
   sw.setAttribute("aria-busy", "true");
   const target = sw.dataset.on !== "1";
   try {
-    const r = await call("PUT", "/settings/steal", { steal_emoji: target });
+    const r = await queueSettingsUpdate(() =>
+      call("PUT", "/settings/steal", { steal_emoji: target })
+    );
     sw.dataset.on = r.steal_emoji ? "1" : "0";
     sw.classList.toggle("on", !!r.steal_emoji);
     sw.setAttribute("aria-checked", r.steal_emoji ? "true" : "false");
@@ -249,7 +268,9 @@ async function toggleStealApproval() {
   sw.setAttribute("aria-busy", "true");
   const target = sw.dataset.on !== "1";
   try {
-    const r = await call("PUT", "/settings/steal-approval", { steal_require_approval: target });
+    const r = await queueSettingsUpdate(() =>
+      call("PUT", "/settings/steal-approval", { steal_require_approval: target })
+    );
     sw.dataset.on = r.steal_require_approval ? "1" : "0";
     sw.classList.toggle("on", !!r.steal_require_approval);
     sw.setAttribute("aria-checked", r.steal_require_approval ? "true" : "false");
