@@ -153,6 +153,9 @@ class StickerPlusPlugin(BasePlugin):
     # ------------------------------------------------------------------
 
     async def initialize(self):
+        # Re-entrant: the host may re-initialize this same instance. A stale
+        # hot-reload flag would then shorten every later process shutdown.
+        self._hot_reload = False
         # Tear down any previous incarnation first (hot reload safety).
         await self._shutdown_components()
 
@@ -608,9 +611,16 @@ class StickerPlusPlugin(BasePlugin):
             raise HTTPException(status_code=503, detail="Plugin manager not available")
         # Hot reload, not a process shutdown: keep the in-flight-send grace short
         self._hot_reload = True
-        updated = await plugin_mgr.update_plugin_config(
-            PLUGIN_ID, {"steal_emoji": bool(request.steal_emoji)}
-        )
+        try:
+            updated = await plugin_mgr.update_plugin_config(
+                PLUGIN_ID, {"steal_emoji": bool(request.steal_emoji)}
+            )
+        finally:
+            # The flag must never outlive the update: when the host does not
+            # terminate this instance (update raised, or it re-initialized the
+            # same object in place), a later real process shutdown would
+            # otherwise degrade to the short hot-reload grace.
+            self._hot_reload = False
         return {"steal_emoji": bool(updated.get("steal_emoji", request.steal_emoji))}
 
     @register.api(method="PUT", path="/settings/steal-approval")
@@ -626,10 +636,14 @@ class StickerPlusPlugin(BasePlugin):
             raise HTTPException(status_code=503, detail="Plugin manager not available")
         # Hot reload, not a process shutdown: keep the in-flight-send grace short
         self._hot_reload = True
-        updated = await plugin_mgr.update_plugin_config(
-            PLUGIN_ID,
-            {"steal_require_approval": bool(request.steal_require_approval)},
-        )
+        try:
+            updated = await plugin_mgr.update_plugin_config(
+                PLUGIN_ID,
+                {"steal_require_approval": bool(request.steal_require_approval)},
+            )
+        finally:
+            # See set_steal: never let the flag outlive the update.
+            self._hot_reload = False
         return {
             "steal_require_approval": bool(
                 updated.get("steal_require_approval", request.steal_require_approval)

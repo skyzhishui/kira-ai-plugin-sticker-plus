@@ -479,3 +479,33 @@ async def test_hot_reload_shutdown_grace_is_short(plugin, monkeypatch):
         plugin._bg_sends.discard(hang)
         hang.cancel()
         await asyncio.gather(hang, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_hot_reload_flag_does_not_outlive_the_update(plugin):
+    """_hot_reload 不得残留：更新失败、或宿主原地重初始化时都必须复位。
+
+    Regression (neko review): the flag was never cleared, so an instance that
+    stayed alive after a failed config update (or an in-place re-initialize)
+    would shorten every later process shutdown to the hot-reload grace and tear
+    manager/db down under in-flight sends.
+    """
+
+    class _FailingMgr:
+        def has_plugin(self, plugin_id):
+            return True
+
+        async def update_plugin_config(self, plugin_id, cfg):
+            raise RuntimeError("config update failed")
+
+    plugin.ctx.plugin_mgr = _FailingMgr()
+    try:
+        with pytest.raises(RuntimeError):
+            await plugin.set_steal(main_mod.StealSettingRequest(steal_emoji=True))
+        assert plugin._hot_reload is False, "flag leaked after a failed update"
+
+        plugin._hot_reload = True
+        await plugin.initialize()  # host re-initializes the same instance
+        assert plugin._hot_reload is False, "flag survived initialize()"
+    finally:
+        del plugin.ctx.plugin_mgr
