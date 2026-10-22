@@ -944,3 +944,31 @@ async def test_process_shutdown_flag_extends_grace(plugin, monkeypatch):
     release_pick.set()
     if plugin._bg_sends:
         await asyncio.gather(*list(plugin._bg_sends), return_exceptions=True)
+
+@pytest.mark.asyncio
+async def test_settled_record_survives_budget_exhaustion(plugin, monkeypatch):
+    """预算耗尽后，已结算的记录仍须读取：结果就在那儿，读取零成本。
+
+    Regression (neko review): the budget-exhausted branch skipped records
+    without checking ``done.is_set()`` first, so a record that HAD settled
+    (e.g. the second tag finished quickly while the first pick ate the
+    budget) was dropped - the sticker went out but the model was never
+    told, inviting duplicate sends.
+    """
+    monkeypatch.setattr(main_mod, "SEND_RECORD_WAIT_TIMEOUT", 0.1)
+
+    slow = main_mod._PendingStickerSend()  # never settles in this test
+    settled = main_mod._PendingStickerSend()
+    settled.ok = True
+    settled.detail = "编号1（一只小动物很开心的样子）"
+    settled.done.set()
+    # Slow first: its wait consumes the whole batch budget.
+    plugin._pending_sends[SID] = [slow, settled]
+
+    raw = "<msg><sticker_plus>开心</sticker_plus></msg>"
+    step_result = make_step_result(raw)
+    await plugin.attach_sticker_send_record(make_batch_event(), step_result)
+    assert step_result.raw_output.count(
+        "<system_reminder>已随本条消息发送表情包：编号1"
+    ) == 1, "settled record must be read even after the budget is exhausted"
+    assert SID not in plugin._pending_sends

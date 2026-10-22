@@ -631,20 +631,27 @@ class StickerPlusPlugin(BasePlugin):
         deadline = asyncio.get_running_loop().time() + SEND_RECORD_WAIT_TIMEOUT
         skipped_over_budget = 0
         for pending in pending_list:
-            remaining = deadline - asyncio.get_running_loop().time()
-            if remaining <= 0:
-                skipped_over_budget += 1
-                continue
-            try:
-                # Wait on the event, not the task: on timeout the task keeps
-                # running and the sticker still goes out.
-                await asyncio.wait_for(pending.done.wait(), timeout=remaining)
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "sticker_plus send not settled within the %.0fs batch budget; record skipped",
-                    SEND_RECORD_WAIT_TIMEOUT,
-                )
-                continue
+            if not pending.done.is_set():
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    skipped_over_budget += 1
+                    continue
+                try:
+                    # Wait on the event, not the task: on timeout the task
+                    # keeps running and the sticker still goes out.
+                    await asyncio.wait_for(
+                        pending.done.wait(), timeout=remaining
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "sticker_plus send not settled within the %.0fs batch budget; record skipped",
+                        SEND_RECORD_WAIT_TIMEOUT,
+                    )
+                    continue
+            # Settled records are read even after the batch budget is
+            # exhausted: the result is already sitting there and reading it
+            # costs no await - skipping it would send the sticker but never
+            # tell the model, inviting duplicate sends.
             if not pending.detail:
                 continue
             if pending.ok:
