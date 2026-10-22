@@ -80,18 +80,20 @@ PENDING_SWEEP_MAX_AGE = 300.0
 # stickers already scheduled still go out without blocking shutdown forever.
 BG_SEND_SHUTDOWN_GRACE = 15.0
 
-# Same grace for hot reload / config update (our own settings endpoints call
-# update_plugin_config -> init_plugin -> terminate on this instance). Kept
-# short on purpose: the HTTP request that triggered the update waits for it,
-# so a slow pick would otherwise block the management page for up to
-# BG_SEND_SHUTDOWN_GRACE per toggle.
+# Same grace for every host-management path that is NOT a process exit:
+# our own settings endpoints (update_plugin_config -> init_plugin ->
+# terminate on this instance) AND host-driven disable / reload / uninstall
+# (set_plugin_enabled(False), prepare_plugin_reload, ... all call the same
+# terminate()). Kept short on purpose: an HTTP request or management action
+# waits for it, so a slow pick must not block it for the full shutdown
+# grace.
 #
 # The trade-off this implies (a pick often needs longer than this grace) is
 # handled by deferral, not by tearing resources out from under the send: when
 # sends are still running when the grace expires, the components they were
 # scheduled against are detached and handed to a background drainer task
 # (see _drain_detached_components) that releases them once the sends settle.
-# The settings request therefore unblocks after ~this grace while the sends
+# The triggering request therefore unblocks after ~this grace while the sends
 # still finish against their own manager/database.
 HOT_RELOAD_SEND_GRACE = 2.0
 
@@ -147,6 +149,14 @@ _active_drainers: set[asyncio.Task] = set()
 # A counter, not a bool: overlapping windows from stale-routed requests must
 # not cancel each other's short grace.
 _hot_reload_depth = 0
+
+# Set by our ON_SHUTDOWN hook: the host fires it in lifecycle.stop() BEFORE
+# plugin_manager.terminate(), which makes it the one reliable signal that a
+# terminate() is a process exit rather than a plugin disable / reload /
+# settings update (those all call the same instance method with no reason).
+# Only a process exit may force-tear components under still-running sends;
+# every host-management path defers via the drainer instead.
+_process_shutting_down = False
 
 STICKER_PLUS_TAG_DESCRIPTION = (
     "<sticker_plus>情绪</sticker_plus> # 发送一个表情包消息用于情绪表达，"
@@ -315,6 +325,20 @@ class StickerPlusPlugin(BasePlugin):
     async def terminate(self):
         await self._shutdown_components()
 
+    @on.shutdown()
+    async def _on_host_shutdown(self):
+        """Mark this terminate sequence as a process exit.
+
+        The host fires ON_SHUTDOWN in lifecycle.stop() BEFORE
+        plugin_manager.terminate(); every other caller of terminate()
+        (settings update via update_plugin_config, plugin disable / reload /
+        uninstall) does not. _shutdown_components uses this flag to pick the
+        full shutdown grace (force teardown allowed, process is exiting)
+        over the short management grace + drainer handoff.
+        """
+        global _process_shutting_down
+        _process_shutting_down = True
+
     async def _shutdown_components(
         self, wait_detached_drainers: bool = True
     ) -> None:
@@ -357,22 +381,30 @@ class StickerPlusPlugin(BasePlugin):
             for task in list(_active_drainers):
                 if task.get_loop() is not loop:
                     _active_drainers.discard(task)
-            hot_reload = _hot_reload_depth > 0
+            # Only a process exit (ON_SHUTDOWN fired before terminate) may
+            # force-tear components under still-running sends - every other
+            # caller (settings update, host disable/reload/uninstall) is a
+            # management action that must unblock fast and defer instead.
+            process_shutdown = _process_shutting_down
+            hot_reload = _hot_reload_depth > 0 and not process_shutdown
             waiters = set(self._bg_sends)
-            if not hot_reload and wait_detached_drainers:
-                # Process shutdown (default): sends detached by an earlier
-                # hot reload are owned by their drainers; they deserve the
-                # same bounded grace as our own sends, even when this
-                # instance has no in-flight send left of its own. Not waited
-                # for on hot reload (unblocking fast is that path's whole
+            if process_shutdown and wait_detached_drainers:
+                # Sends detached by an earlier deferral are owned by their
+                # drainers; at process shutdown they deserve the same
+                # bounded grace as our own sends, even when this instance
+                # has no in-flight send left of its own. Not waited for on
+                # the management paths (unblocking fast is their whole
                 # point) nor inside initialize()'s internal teardown (the
                 # drainers release themselves; blocking re-initialization
                 # would stall the settings request behind it).
                 waiters |= set(_active_drainers)
             if waiters:
-                grace = HOT_RELOAD_SEND_GRACE if hot_reload else BG_SEND_SHUTDOWN_GRACE
+                grace = (
+                    BG_SEND_SHUTDOWN_GRACE if process_shutdown
+                    else HOT_RELOAD_SEND_GRACE
+                )
                 done, still_running = await asyncio.wait(waiters, timeout=grace)
-                if still_running and hot_reload:
+                if still_running and not process_shutdown:
                     # Re-snapshot instead of intersecting with the pre-wait
                     # set: _closing refuses NEW schedules, but anything that
                     # slipped in between the snapshot and here must still be

@@ -129,6 +129,7 @@ async def _clean_module_drainers():
         await asyncio.gather(*live, return_exceptions=True)
     main_mod._active_drainers.clear()
     main_mod._hot_reload_depth = 0
+    main_mod._process_shutting_down = False
 
 
 @pytest.mark.asyncio
@@ -407,6 +408,7 @@ async def test_shutdown_cleanup_survives_cancelled_grace_wait(plugin):
 
     stealer = _FakeStealer()
     plugin._stealer = stealer
+    main_mod._process_shutting_down = True
     # A never-finishing background send keeps asyncio.wait inside the grace
     # window long enough to be cancelled.
     ev = asyncio.Event()
@@ -747,6 +749,7 @@ async def test_shutdown_waits_for_drainers_without_own_sends(plugin, monkeypatch
     where the release awaits are not guaranteed to run at all.
     """
     monkeypatch.setattr(main_mod, "BG_SEND_SHUTDOWN_GRACE", 2.0)
+    main_mod._process_shutting_down = True
     release = asyncio.Event()
     hang = asyncio.ensure_future(release.wait())
 
@@ -913,3 +916,111 @@ async def test_depth_is_module_level_across_instances(plugin, monkeypatch):
         drainers = set(main_mod._active_drainers)
         if drainers:
             await asyncio.gather(*drainers, return_exceptions=True)
+
+@pytest.mark.asyncio
+async def test_disable_path_defers_instead_of_blocking(plugin, monkeypatch):
+    """禁用/重载路径（非进程停机）不得等满 15s：短宽限 + drainer 接手。
+
+    Regression (neko review): terminate() cannot tell a plugin disable /
+    reload (host management, depth 0) from a process exit, so with an
+    in-flight send the disable request used to block for the full
+    BG_SEND_SHUTDOWN_GRACE. Only a process exit may force-tear; management
+    paths must unblock fast and hand the send to the drainer.
+    """
+    monkeypatch.setattr(main_mod, "HOT_RELOAD_SEND_GRACE", 0.05)
+    monkeypatch.setattr(main_mod, "BG_SEND_SHUTDOWN_GRACE", 3.0)
+    assert main_mod._hot_reload_depth == 0
+    assert not main_mod._process_shutting_down
+
+    pick_started = asyncio.Event()
+    release_pick = asyncio.Event()
+    shutdown_calls: list[float] = []
+    real_manager = plugin._manager
+
+    class _SlowPickManager:
+        def __getattr__(self, name):
+            return getattr(real_manager, name)
+
+        async def pick_emoji(self, emotion, recent_context):
+            pick_started.set()
+            await release_pick.wait()
+            return None
+
+        async def shutdown(self):
+            shutdown_calls.append(time.monotonic())
+            await real_manager.shutdown()
+
+    plugin._manager = _SlowPickManager()
+    plugin._schedule_sticker_send("开心", "", "chat-1")
+    assert await asyncio.wait_for(pick_started.wait(), timeout=2)
+
+    # Host-driven disable: terminate() with no settings update in flight and
+    # no process shutdown.
+    start = time.monotonic()
+    await plugin.terminate()
+    elapsed = time.monotonic() - start
+    assert elapsed < 1.5, (
+        f"disable blocked {elapsed:.2f}s behind a slow send"
+    )
+    assert shutdown_calls == [], "components disposed while the send still ran"
+    assert plugin._manager is None, "components handed to the drainer"
+    assert main_mod._active_drainers, "a drainer should own the components"
+
+    release_pick.set()
+    await asyncio.wait_for(
+        asyncio.gather(*list(main_mod._active_drainers)), timeout=5
+    )
+    assert len(shutdown_calls) == 1, "detached manager released exactly once"
+
+
+@pytest.mark.asyncio
+async def test_process_shutdown_flag_extends_grace(plugin, monkeypatch):
+    """ON_SHUTDOWN 置位后，terminate 恢复长宽限（进程停机语义）。
+
+    The hook fires in lifecycle.stop() before plugin_manager.terminate(); its
+    flag is what keeps the process-exit path on BG_SEND_SHUTDOWN_GRACE (force
+    teardown allowed) while every management path defers.
+    """
+    monkeypatch.setattr(main_mod, "HOT_RELOAD_SEND_GRACE", 0.05)
+    monkeypatch.setattr(main_mod, "BG_SEND_SHUTDOWN_GRACE", 1.0)
+
+    pick_started = asyncio.Event()
+    release_pick = asyncio.Event()
+    shutdown_calls: list[float] = []
+    real_manager = plugin._manager
+
+    class _SlowPickManager:
+        def __getattr__(self, name):
+            return getattr(real_manager, name)
+
+        async def pick_emoji(self, emotion, recent_context):
+            pick_started.set()
+            await release_pick.wait()
+            return None
+
+        async def shutdown(self):
+            shutdown_calls.append(time.monotonic())
+            await real_manager.shutdown()
+
+    plugin._manager = _SlowPickManager()
+    plugin._schedule_sticker_send("开心", "", "chat-1")
+    assert await asyncio.wait_for(pick_started.wait(), timeout=2)
+
+    # The host fires the hook before terminating plugins.
+    await plugin._on_host_shutdown()
+    assert main_mod._process_shutting_down is True
+
+    start = time.monotonic()
+    await plugin.terminate()
+    elapsed = time.monotonic() - start
+    assert elapsed >= 0.8, (
+        f"process shutdown waited only {elapsed:.2f}s - flag not honored"
+    )
+    # Process exit force-releases after the grace (documented semantics):
+    # the send is still parked, yet its components were released.
+    assert len(shutdown_calls) == 1, "process shutdown force-releases components"
+    assert not main_mod._active_drainers, "no drainer on the process path"
+
+    release_pick.set()
+    if plugin._bg_sends:
+        await asyncio.gather(*list(plugin._bg_sends), return_exceptions=True)
