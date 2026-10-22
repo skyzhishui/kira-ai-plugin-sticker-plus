@@ -137,25 +137,17 @@ _settings_update_lock = _LoopLocalLock()
 # these too, so detached sends still get their bounded grace.
 _active_drainers: set[asyncio.Task] = set()
 
-# Depth of in-flight settings updates (our own PUT /settings/* handlers),
-# counted across ALL instances of this plugin: the host replaces the instance
-# inside update_plugin_config, and a second request dispatched before the
-# routes rebind still runs on the stale instance - its handler would raise a
-# per-instance counter on an object the host no longer terminates, while the
-# actually-terminated fresh instance would observe 0 and fall back to the
-# long process-shutdown grace (blocking that request ~15s and force-releasing
-# components under in-flight sends). Module-level, like the lock, so any
-# teardown running inside an update window sees the hot-reload grace.
-# A counter, not a bool: overlapping windows from stale-routed requests must
-# not cancel each other's short grace.
-_hot_reload_depth = 0
-
 # Set by our ON_SHUTDOWN hook: the host fires it in lifecycle.stop() BEFORE
 # plugin_manager.terminate(), which makes it the one reliable signal that a
 # terminate() is a process exit rather than a plugin disable / reload /
 # settings update (those all call the same instance method with no reason).
 # Only a process exit may force-tear components under still-running sends;
 # every host-management path defers via the drainer instead.
+#
+# Grace history: an earlier revision gated the short grace on a module-level
+# "settings update in flight" counter; the ON_SHUTDOWN flag supersedes it -
+# every terminate() that is not a process exit wants the same short-grace +
+# drainer behavior, so no counter is needed (or read) anymore.
 _process_shutting_down = False
 
 STICKER_PLUS_TAG_DESCRIPTION = (
@@ -262,9 +254,8 @@ class StickerPlusPlugin(BasePlugin):
         self._pending_sends: dict[str, list[_PendingStickerSend]] = {}
         # Strong references so fire-and-forget send tasks are never GC'd.
         self._bg_sends: set[asyncio.Task] = set()
-        # (Settings-update depth lives at module level: see _hot_reload_depth
-        # there. The instance replacement inside update_plugin_config makes a
-        # per-instance counter observe the wrong teardown.)
+        # (The grace choice for teardown lives on _process_shutting_down at
+        # module level; nothing instance-scoped is needed for it.)
         # True while _shutdown_components() is closing this incarnation (or
         # until a successful initialize() reopens it): background sends
         # scheduled during the close would miss both the waiter snapshot and
@@ -357,16 +348,19 @@ class StickerPlusPlugin(BasePlugin):
         # and its task keeps using the (snapshot) manager and the database
         # below, so those must not be disposed underneath it.
         #
-        # Two paths diverge here:
-        # - Process shutdown (depth == 0): wait the full grace (also for
-        #   drainers still releasing older components), then tear down even
-        #   if sends remain - the process is exiting anyway.
-        # - Hot reload / config update (depth > 0): the triggering HTTP
-        #   request must not block for the full grace. If sends are still
-        #   running when the short grace expires, detach the components and
-        #   hand both to a background drainer (_drain_detached_components):
-        #   the sends finish against the resources they were scheduled with,
-        #   the request unblocks now, and the drainer releases the components
+        # Two paths diverge here, selected purely by _process_shutting_down
+        # (set by our ON_SHUTDOWN hook; see its comment for why that flag is
+        # the only reliable discriminator):
+        # - Process exit: wait the full grace (also for drainers still
+        #   releasing older components), then tear down even if sends remain
+        #   - the process is exiting anyway.
+        # - Every other caller (settings update, host disable / reload /
+        #   uninstall): a request or management action waits for this, so it
+        #   must not block for the full grace. If sends are still running
+        #   when the short grace expires, detach the components and hand
+        #   both to a background drainer (_drain_detached_components): the
+        #   sends finish against the resources they were scheduled with, the
+        #   caller unblocks now, and the drainer releases the components
         #   afterwards (bounded by BG_SEND_SHUTDOWN_GRACE).
         #
         # The teardown lives in a finally block on purpose: when this wait is
@@ -386,7 +380,6 @@ class StickerPlusPlugin(BasePlugin):
             # caller (settings update, host disable/reload/uninstall) is a
             # management action that must unblock fast and defer instead.
             process_shutdown = _process_shutting_down
-            hot_reload = _hot_reload_depth > 0 and not process_shutdown
             waiters = set(self._bg_sends)
             if process_shutdown and wait_detached_drainers:
                 # Sends detached by an earlier deferral are owned by their
@@ -841,22 +834,15 @@ class StickerPlusPlugin(BasePlugin):
         plugin_mgr = getattr(self.ctx, "plugin_mgr", None)
         if plugin_mgr is None or not plugin_mgr.has_plugin(PLUGIN_ID):
             raise HTTPException(status_code=503, detail="Plugin manager not available")
-        global _hot_reload_depth
+        # update_plugin_config terminates + rebuilds plugin instances; the
+        # module-level lock serializes that across pages, clients and the
+        # stale/fresh instance swap. Grace for the teardown is not set here:
+        # every non-process-exit terminate takes the short grace + drainer
+        # path (see _process_shutting_down).
         async with _settings_update_lock:
-            # Hot reload, not a process shutdown: keep the in-flight-send
-            # grace short. The counter is module-level: this handler may run
-            # on a stale instance while the host terminates the current one.
-            _hot_reload_depth += 1
-            try:
-                updated = await plugin_mgr.update_plugin_config(
-                    PLUGIN_ID, {"steal_emoji": bool(request.steal_emoji)}
-                )
-            finally:
-                # Balanced even when the update raises or the host
-                # re-initializes an instance in place: the depth must never
-                # outlive the request, or a later real shutdown would use
-                # the short grace.
-                _hot_reload_depth -= 1
+            updated = await plugin_mgr.update_plugin_config(
+                PLUGIN_ID, {"steal_emoji": bool(request.steal_emoji)}
+            )
         return {"steal_emoji": bool(updated.get("steal_emoji", request.steal_emoji))}
 
     @register.api(method="PUT", path="/settings/steal-approval")
@@ -871,19 +857,13 @@ class StickerPlusPlugin(BasePlugin):
         plugin_mgr = getattr(self.ctx, "plugin_mgr", None)
         if plugin_mgr is None or not plugin_mgr.has_plugin(PLUGIN_ID):
             raise HTTPException(status_code=503, detail="Plugin manager not available")
-        global _hot_reload_depth
+        # See set_steal: module-level lock only; the teardown grace needs no
+        # per-request state (see _process_shutting_down).
         async with _settings_update_lock:
-            # See set_steal: module-level depth, short grace, balanced in
-            # finally.
-            _hot_reload_depth += 1
-            try:
-                updated = await plugin_mgr.update_plugin_config(
-                    PLUGIN_ID,
-                    {"steal_require_approval": bool(request.steal_require_approval)},
-                )
-            finally:
-                # Never let the depth outlive the update.
-                _hot_reload_depth -= 1
+            updated = await plugin_mgr.update_plugin_config(
+                PLUGIN_ID,
+                {"steal_require_approval": bool(request.steal_require_approval)},
+            )
         return {
             "steal_require_approval": bool(
                 updated.get("steal_require_approval", request.steal_require_approval)
