@@ -470,7 +470,7 @@ async def test_hot_reload_shutdown_grace_is_short(plugin, monkeypatch):
     hang = asyncio.ensure_future(ev.wait())
     plugin._bg_sends.add(hang)
     try:
-        plugin._hot_reload = True
+        plugin._hot_reload_depth = 1
         start = time.monotonic()
         await plugin._shutdown_components()
         elapsed = time.monotonic() - start
@@ -502,10 +502,53 @@ async def test_hot_reload_flag_does_not_outlive_the_update(plugin):
     try:
         with pytest.raises(RuntimeError):
             await plugin.set_steal(main_mod.StealSettingRequest(steal_emoji=True))
-        assert plugin._hot_reload is False, "flag leaked after a failed update"
+        assert plugin._hot_reload_depth == 0, "depth leaked after a failed update"
 
-        plugin._hot_reload = True
-        await plugin.initialize()  # host re-initializes the same instance
-        assert plugin._hot_reload is False, "flag survived initialize()"
+        # An in-place re-initialize inside an update keeps the depth > 0, and
+        # the balanced decrement afterwards must leave no residue.
+        plugin._hot_reload_depth = 1
+        await plugin.initialize()
+        plugin._hot_reload_depth -= 1
+        assert plugin._hot_reload_depth == 0
+    finally:
+        del plugin.ctx.plugin_mgr
+
+
+@pytest.mark.asyncio
+async def test_hot_reload_depth_survives_concurrent_updates(plugin):
+    """并发设置请求：先完成的那个不得把另一个的短宽限退回长宽限。
+
+    Regression (neko review): a single instance-level bool meant the first
+    update to finish cleared the flag while another terminate was still
+    pending, so that request fell back to BG_SEND_SHUTDOWN_GRACE (15s).
+    """
+    seen = []
+    gate = asyncio.Event()
+
+    class _SlowMgr:
+        def has_plugin(self, plugin_id):
+            return True
+
+        async def update_plugin_config(self, plugin_id, cfg):
+            seen.append(plugin._hot_reload_depth)
+            await gate.wait()
+            return cfg
+
+    plugin.ctx.plugin_mgr = _SlowMgr()
+    try:
+        t1 = asyncio.ensure_future(
+            plugin.set_steal(main_mod.StealSettingRequest(steal_emoji=True))
+        )
+        t2 = asyncio.ensure_future(
+            plugin.set_steal_approval(
+                main_mod.StealApprovalSettingRequest(steal_require_approval=False)
+            )
+        )
+        await asyncio.sleep(0.05)
+        assert plugin._hot_reload_depth == 2, "both in-flight updates must be counted"
+        gate.set()
+        await asyncio.gather(t1, t2)
+        assert plugin._hot_reload_depth == 0
+        assert seen == [1, 2], "each update must observe its own depth"
     finally:
         del plugin.ctx.plugin_mgr

@@ -143,19 +143,19 @@ class StickerPlusPlugin(BasePlugin):
         self._pending_sends: dict[str, list[_PendingStickerSend]] = {}
         # Strong references so fire-and-forget send tasks are never GC'd.
         self._bg_sends: set[asyncio.Task] = set()
-        # Set by our settings endpoints before they trigger a config update:
-        # that path terminates this instance too, but it is a hot reload, not
-        # a process shutdown, so the grace wait must stay short.
-        self._hot_reload = False
+        # Depth counter of in-flight settings updates (our own PUT /settings/*
+        # handlers). That path terminates this instance too, but it is a hot
+        # reload, not a process shutdown, so the grace wait must stay short.
+        # A counter, not a bool: concurrent updates (multi-tab, other clients)
+        # overlap, and the first one finishing must not switch the grace back
+        # to the shutdown value while another terminate is still pending.
+        self._hot_reload_depth = 0
 
     # ------------------------------------------------------------------
     # Lifecycle (must be re-entrant: config updates re-run initialize())
     # ------------------------------------------------------------------
 
     async def initialize(self):
-        # Re-entrant: the host may re-initialize this same instance. A stale
-        # hot-reload flag would then shorten every later process shutdown.
-        self._hot_reload = False
         # Tear down any previous incarnation first (hot reload safety).
         await self._shutdown_components()
 
@@ -214,7 +214,7 @@ class StickerPlusPlugin(BasePlugin):
                 # Hot reload / config update must not block the management page
                 # for the full shutdown grace: see HOT_RELOAD_SEND_GRACE.
                 grace = (
-                    HOT_RELOAD_SEND_GRACE if self._hot_reload
+                    HOT_RELOAD_SEND_GRACE if self._hot_reload_depth > 0
                     else BG_SEND_SHUTDOWN_GRACE
                 )
                 done, still_running = await asyncio.wait(
@@ -414,13 +414,11 @@ class StickerPlusPlugin(BasePlugin):
         # One deadline for the whole batch: per-record timeouts would multiply
         # into len(pending_list) * SEND_RECORD_WAIT_TIMEOUT in the worst case.
         deadline = asyncio.get_running_loop().time() + SEND_RECORD_WAIT_TIMEOUT
+        skipped_over_budget = 0
         for pending in pending_list:
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
-                logger.warning(
-                    "sticker_plus send not settled within the %.0fs batch budget; record skipped",
-                    SEND_RECORD_WAIT_TIMEOUT,
-                )
+                skipped_over_budget += 1
                 continue
             try:
                 # Wait on the event, not the task: on timeout the task keeps
@@ -442,6 +440,13 @@ class StickerPlusPlugin(BasePlugin):
                 lines.append(
                     f"<system_reminder>本次表情包未发送：{pending.detail}</system_reminder>"
                 )
+        if skipped_over_budget:
+            # One summary line instead of one warning per remaining record.
+            logger.warning(
+                "sticker_plus batch budget (%.0fs) exhausted; %d pending record(s) skipped",
+                SEND_RECORD_WAIT_TIMEOUT,
+                skipped_over_budget,
+            )
         if lines:
             step_result.raw_output = raw + "\n" + "\n".join(lines)
 
@@ -610,17 +615,16 @@ class StickerPlusPlugin(BasePlugin):
         if plugin_mgr is None or not plugin_mgr.has_plugin(PLUGIN_ID):
             raise HTTPException(status_code=503, detail="Plugin manager not available")
         # Hot reload, not a process shutdown: keep the in-flight-send grace short
-        self._hot_reload = True
+        self._hot_reload_depth += 1
         try:
             updated = await plugin_mgr.update_plugin_config(
                 PLUGIN_ID, {"steal_emoji": bool(request.steal_emoji)}
             )
         finally:
-            # The flag must never outlive the update: when the host does not
-            # terminate this instance (update raised, or it re-initialized the
-            # same object in place), a later real process shutdown would
-            # otherwise degrade to the short hot-reload grace.
-            self._hot_reload = False
+            # Balanced even when the update raises or the host re-initializes
+            # this same instance in place: the depth must never outlive the
+            # request, or a later real shutdown would use the short grace.
+            self._hot_reload_depth -= 1
         return {"steal_emoji": bool(updated.get("steal_emoji", request.steal_emoji))}
 
     @register.api(method="PUT", path="/settings/steal-approval")
@@ -635,15 +639,15 @@ class StickerPlusPlugin(BasePlugin):
         if plugin_mgr is None or not plugin_mgr.has_plugin(PLUGIN_ID):
             raise HTTPException(status_code=503, detail="Plugin manager not available")
         # Hot reload, not a process shutdown: keep the in-flight-send grace short
-        self._hot_reload = True
+        self._hot_reload_depth += 1
         try:
             updated = await plugin_mgr.update_plugin_config(
                 PLUGIN_ID,
                 {"steal_require_approval": bool(request.steal_require_approval)},
             )
         finally:
-            # See set_steal: never let the flag outlive the update.
-            self._hot_reload = False
+            # See set_steal: never let the depth outlive the update.
+            self._hot_reload_depth -= 1
         return {
             "steal_require_approval": bool(
                 updated.get("steal_require_approval", request.steal_require_approval)
